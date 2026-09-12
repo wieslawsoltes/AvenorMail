@@ -1,9 +1,23 @@
 import { DatabaseSync } from 'node:sqlite';
+import { RemoteDatabase } from './remote-db.js';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, unlinkSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { randomUUID, createCipheriv, createDecipheriv } from 'node:crypto';
-export function openDatabase(filename){if(filename!==':memory:')mkdirSync(resolve(filename,'..'),{recursive:true,mode:0o700});const db=new DatabaseSync(filename);db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');db.exec('CREATE TABLE IF NOT EXISTS backend_migrations (name TEXT PRIMARY KEY, applied INTEGER NOT NULL)');const initial='0000_warm_stick';if(!db.prepare('SELECT name FROM backend_migrations WHERE name=?').get(initial)){db.exec('BEGIN IMMEDIATE');try{db.exec(readFileSync(new URL('../drizzle/0000_warm_stick.sql',import.meta.url),'utf8'));db.prepare('INSERT INTO backend_migrations VALUES (?,?)').run(initial,Date.now());db.exec('COMMIT');}catch(error){db.exec('ROLLBACK');throw error;}}db.exec('CREATE INDEX IF NOT EXISTS idx_users_email ON users(email); CREATE INDEX IF NOT EXISTS idx_records_scope_deleted_id ON records(scope,deleted,id); CREATE UNIQUE INDEX IF NOT EXISTS idx_teams_invite ON teams(invite)');return db;}
-export function asD1(db){return {prepare(sql){const statement=db.prepare(sql);let args=[];return {bind(...values){args=values;return this;},async first(){return statement.get(...args)||null;},async all(){return {results:statement.all(...args)};},runSync(){const result=statement.run(...args);return {meta:{changes:Number(result.changes),last_row_id:Number(result.lastInsertRowid)}};},async run(){return this.runSync();}};},async batch(statements){db.exec('BEGIN IMMEDIATE');try{const results=statements.map(statement=>statement.runSync());db.exec('COMMIT');return results;}catch(error){db.exec('ROLLBACK');throw error;}}};}
+export function openDatabase(filename,env={}){
+ if(!env.DATABASE_URL&&filename!==':memory:')mkdirSync(resolve(filename,'..'),{recursive:true,mode:0o700});
+ const db=env.DATABASE_URL?new RemoteDatabase({url:env.DATABASE_URL,authToken:env.DATABASE_AUTH_TOKEN}):new DatabaseSync(filename);
+ if(!env.DATABASE_URL)db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
+ db.exec('CREATE TABLE IF NOT EXISTS backend_migrations (name TEXT PRIMARY KEY, applied INTEGER NOT NULL)');
+ const initial='0000_warm_stick';
+ db.exec('BEGIN IMMEDIATE');try{
+  if(!db.prepare('SELECT name FROM backend_migrations WHERE name=?').get(initial)){
+   db.exec(readFileSync(new URL('../drizzle/0000_warm_stick.sql',import.meta.url),'utf8'));
+   db.prepare('INSERT INTO backend_migrations VALUES (?,?)').run(initial,Date.now());
+  }db.exec('COMMIT');
+ }catch(error){db.exec('ROLLBACK');db.close();throw error;}
+ db.exec('CREATE INDEX IF NOT EXISTS idx_users_email ON users(email); CREATE INDEX IF NOT EXISTS idx_records_scope_deleted_id ON records(scope,deleted,id); CREATE UNIQUE INDEX IF NOT EXISTS idx_teams_invite ON teams(invite)');return db;
+}
+export function asD1(db){return {prepare(sql){const statement=db.prepare(sql);let args=[];return {get bound(){return {sql,args};},bind(...values){args=values;return this;},async first(){return statement.get(...args)||null;},async all(){return {results:statement.all(...args)};},runSync(){const result=statement.run(...args);return {meta:{changes:Number(result.changes),last_row_id:Number(result.lastInsertRowid)}};},async run(){return this.runSync();}};},async batch(statements){if(db.batch)return db.batch(statements.map(s=>s.bound)).map(r=>({meta:{changes:r.changes,last_row_id:r.lastInsertRowid}}));db.exec('BEGIN IMMEDIATE');try{const results=statements.map(statement=>statement.runSync());db.exec('COMMIT');return results;}catch(error){db.exec('ROLLBACK');throw error;}}};}
 export class FileBucket {
  constructor(directory,key){this.directory=resolve(directory);this.key=key?Buffer.from(key,'base64'):null;if(this.key&&this.key.length!==32)throw Error('DATA_KEY must be a base64-encoded 32-byte key');mkdirSync(this.directory,{recursive:true,mode:0o700});}
  path(id){if(!/^[a-zA-Z0-9:_-]{1,250}$/.test(id))throw Error('Invalid file identifier');return join(this.directory,id);}

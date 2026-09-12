@@ -53,11 +53,14 @@ function validateDocument(doc) {
 
 /** Authenticated, workspace-scoped durable CRDT and record event transport. */
 export class RealtimeHub {
-  constructor({ db, authenticate, authorize, allowedOrigins = [], emit = () => {} }) {
+  constructor({ db, authenticate, authorize, authorizeWrite = null, coordinator = null, allowedOrigins = [], emit = () => {} }) {
     if (!db || !authenticate || !authorize) throw new TypeError('db, authenticate and authorize are required');
     this.db = db;
     this.authenticate = authenticate;
     this.authorize = authorize;
+    this.authorizeWrite = authorizeWrite;
+    this.coordinator = coordinator;
+    this.nodeId = coordinator?.nodeId || randomUUID();
     this.allowedOrigins = new Set(allowedOrigins);
     this.emit = emit;
     this.clients = new Set();
@@ -72,6 +75,7 @@ export class RealtimeHub {
     ); CREATE INDEX IF NOT EXISTS collaboration_scope ON collaboration_documents(scope);`);
     this.select = this.db.prepare('SELECT * FROM collaboration_documents WHERE record_id = ?');
     this.insert = this.db.prepare('INSERT INTO collaboration_documents(record_id, scope, state, revision, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(record_id) DO UPDATE SET state=excluded.state, revision=excluded.revision, updated_at=excluded.updated_at WHERE collaboration_documents.scope=excluded.scope');
+    if (this.coordinator) this.coordinator.migrate();
     return this;
   }
 
@@ -165,27 +169,81 @@ export class RealtimeHub {
     return room;
   }
 
-  persist(room, bytes) {
-    if (this.closed) throw failure('UNAUTHENTICATED', 'Connection is closed.');
+  refreshRoom(room) {
+    const row = this.select.get(room.recordId);
+    if (!row || row.revision <= room.revision) return null;
+    if (row.scope !== room.scope) throw failure('SCOPE_MISMATCH', 'The document belongs to another workspace.');
     const candidate = new Y.Doc();
     try {
-      Y.applyUpdate(candidate, Y.encodeStateAsUpdate(room.doc));
-      Y.applyUpdate(candidate, bytes);
+      Y.applyUpdate(candidate, row.state);
+      validateDocument(candidate);
+      const difference = Y.encodeStateAsUpdate(candidate, Y.encodeStateVector(room.doc));
+      room.doc.destroy(); room.doc = candidate;
+      room.revision = row.revision; room.initialized = true;
+      return difference;
+    } catch (error) { candidate.destroy(); throw error; }
+  }
+
+  persist(room, bytes, { initialize = false, guard } = {}) {
+    if (this.closed) throw failure('UNAUTHENTICATED', 'Connection is closed.');
+    const candidate = new Y.Doc();
+    let transaction = false;
+    try {
+      // A room cache is never the authority for a write. Serializing the read,
+      // merge and revision update also works across independent Node processes.
+      this.db.exec('BEGIN IMMEDIATE'); transaction = true;
+      if (guard) {
+        const allowed = guard();
+        if (allowed?.then) throw failure('BAD_CONFIGURATION', 'The transactional write authorizer must be synchronous.');
+        if (!allowed) throw failure('READ_ONLY', 'This draft is read only or document access was revoked.');
+      }
+      const latest = this.select.get(room.recordId);
+      if (latest && latest.scope !== room.scope) throw failure('SCOPE_MISMATCH', 'The document belongs to another workspace.');
+      if (latest) Y.applyUpdate(candidate, latest.state);
+      const refresh = latest && latest.revision > room.revision ? Y.encodeStateAsUpdate(candidate, Y.encodeStateVector(room.doc)) : null;
+      // Two first writers may carry independently generated HTML seeds. Only
+      // the transaction that creates the row is allowed to apply its seed.
+      if (!initialize || !latest) Y.applyUpdate(candidate, bytes);
       const state = validateDocument(candidate);
-      const revision = room.revision + 1;
-      // Native SQLite autocommit completes before any acknowledgement/broadcast.
-      const result = this.insert.run(room.recordId, room.scope, state, revision, Date.now());
-      if (result.changes !== 1) throw failure('SCOPE_MISMATCH', 'The document belongs to another workspace.');
-      room.doc.destroy();
-      room.doc = candidate;
-      room.revision = revision;
-      room.initialized = true;
+      const revision = initialize && latest ? latest.revision : Number(latest?.revision || 0) + 1;
+      if (!initialize || !latest) {
+        const result = this.insert.run(room.recordId, room.scope, state, revision, Date.now());
+        if (Number(result.changes) !== 1) throw failure('SCOPE_MISMATCH', 'The document belongs to another workspace.');
+      }
+      this.db.exec('COMMIT'); transaction = false;
+      room.doc.destroy(); room.doc = candidate;
+      room.revision = revision; room.initialized = true;
+      room.refreshUpdate = refresh;
+      room.seedAccepted = !initialize || !latest;
+      // The CRDT table trigger records cross-node invalidation in the same
+      // transaction, so a crash after COMMIT cannot lose its event.
       return state;
     } catch (error) {
+      if (transaction) this.db.exec('ROLLBACK');
       candidate.destroy();
-      if (error.code && ['BAD_DOCUMENT', 'SCOPE_MISMATCH'].includes(error.code)) throw error;
+      if (error.code && ['BAD_DOCUMENT', 'SCOPE_MISMATCH', 'READ_ONLY', 'BAD_CONFIGURATION'].includes(error.code)) throw error;
       throw failure('BAD_UPDATE', 'Unable to persist this document update.');
     }
+  }
+
+  async receiveClusterEvent(envelope) {
+    if (this.closed || !envelope) return;
+    const { scope, event } = envelope;
+    if (!event || typeof event !== 'object') return;
+    if (event.type === 'collaboration.updated') {
+      const room = this.rooms.get(event.recordId);
+      if (!room || room.scope !== scope) return;
+      const difference = this.refreshRoom(room);
+      if (difference) await this.broadcastRoom(room, { type: 'update', scope, recordId: room.recordId, update: encode(difference), revision: room.revision });
+      return;
+    }
+    if (event.type === 'presence.changed') {
+      const room = this.rooms.get(event.recordId);
+      if (room?.scope === scope) await this.presence(room, { persist: false });
+      return;
+    }
+    if (['permissions-changed', 'authentication-changed'].includes(event.type) || event.recordId && this.rooms.has(event.recordId)) await this.sweep();
+    if (scope !== '*') await this.publish(scope, event);
   }
 
   async handle(client, message) {
@@ -226,10 +284,14 @@ export class RealtimeHub {
       if (client.rooms.size >= LIVE_LIMITS.rooms && !client.rooms.has(recordId)) throw failure('LIMIT', 'Too many open documents.');
       const writable = await this.can(client, scope, recordId, 'write');
       const room = this.room(recordId, scope);
+      const refreshed = this.refreshRoom(room);
+      if (refreshed) await this.broadcastRoom(room, { type: 'update', scope, recordId, update: encode(refreshed), revision: room.revision });
       let seed;
       if (!room.initialized && writable && message.initialUpdate) {
         seed = decode(message.initialUpdate);
-        this.persist(room, seed);
+        this.persist(room, seed, { initialize: true, guard: this.authorizeWrite ? () => this.authorizeWrite({ request: client.authRequest, user: client.user, scope, recordId, action: 'write' }) : undefined });
+        if (!room.seedAccepted) seed = null;
+        if (room.refreshUpdate) await this.broadcastRoom(room, { type: 'update', scope, recordId, update: encode(room.refreshUpdate), revision: room.revision });
       }
       room.clients.add(client);
       client.rooms.set(recordId, room);
@@ -247,8 +309,9 @@ export class RealtimeHub {
         throw failure('READ_ONLY', 'This draft is read only or has already been sent.');
       }
       const bytes = decode(message.update);
-      this.persist(room, bytes);
+      this.persist(room, bytes, { guard: this.authorizeWrite ? () => this.authorizeWrite({ request: client.authRequest, user: client.user, scope, recordId, action: 'write' }) : undefined });
       this.send(client, { type: 'ack', recordId, scope, requestId: message.requestId, revision: room.revision });
+      if (room.refreshUpdate) await this.broadcastRoom(room, { type: 'update', scope, recordId, update: encode(room.refreshUpdate), revision: room.revision });
       await this.broadcastRoom(room, { type: 'update', scope, recordId, update: encode(bytes), revision: room.revision }, client);
       try { this.emit({ type: 'collaboration.updated', scope, recordId, revision: room.revision }); } catch { /* telemetry must not invalidate durable writes */ }
       return;
@@ -277,9 +340,18 @@ export class RealtimeHub {
     }));
   }
 
-  async presence(room) {
-    // Presence and selection are ephemeral, never trusted as authorization claims.
-    const participants = [...room.clients].filter(client => !client.closed).map(client => ({ clientId: client.id, userId: client.user.userId, displayName: client.user.displayName || client.user.email || 'Teammate', selection: client.selection?.recordId === room.recordId ? client.selection.value : null }));
+  async presence(room, { persist = true, publish = true } = {}) {
+    // Names and identities come from authenticated server sessions only.
+    let participants;
+    if (this.coordinator) {
+      if (persist) {
+        const now = this.coordinator.now();
+        const statement = this.db.prepare('INSERT INTO collaboration_presence(client_id,record_id,node_id,scope,user_id,display_name,selection,expires) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(client_id,record_id) DO UPDATE SET display_name=excluded.display_name,selection=excluded.selection,expires=excluded.expires');
+        for (const client of room.clients) if (!client.closed) statement.run(client.id, room.recordId, this.nodeId, room.scope, client.user.userId, client.user.displayName || client.user.email || 'Teammate', JSON.stringify(client.selection?.recordId === room.recordId ? client.selection.value : null), now + 10000);
+        if (publish) this.coordinator.publish(room.scope, { type: 'presence.changed', recordId: room.recordId });
+      }
+      participants = this.db.prepare('SELECT client_id AS clientId,user_id AS userId,display_name AS displayName,selection FROM collaboration_presence WHERE record_id=? AND scope=? AND expires>? ORDER BY client_id').all(room.recordId, room.scope, this.coordinator.now()).map(row => ({ ...row, selection: JSON.parse(row.selection || 'null') }));
+    } else participants = [...room.clients].filter(client => !client.closed).map(client => ({ clientId: client.id, userId: client.user.userId, displayName: client.user.displayName || client.user.email || 'Teammate', selection: client.selection?.recordId === room.recordId ? client.selection.value : null }));
     await this.broadcastRoom(room, { type: 'presence', scope: room.scope, recordId: room.recordId, participants });
   }
 
@@ -288,7 +360,11 @@ export class RealtimeHub {
     if (!room) return;
     room.clients.delete(client);
     client.rooms.delete(recordId);
-    if (room.clients.size) this.presence(room).catch(() => {});
+    if (this.coordinator) {
+      this.db.prepare('DELETE FROM collaboration_presence WHERE client_id=? AND record_id=? AND node_id=?').run(client.id, recordId, this.nodeId);
+      this.coordinator.publish(room.scope, { type: 'presence.changed', recordId });
+    }
+    if (room.clients.size) this.presence(room, { persist: false }).catch(() => {});
     else { room.doc.destroy(); this.rooms.delete(recordId); }
   }
 
@@ -318,6 +394,11 @@ export class RealtimeHub {
           }
         } catch { client.ws.close(4401, 'Session expired'); }
       }));
+      if (this.coordinator) {
+        const now = this.coordinator.now();
+        this.db.prepare('DELETE FROM collaboration_presence WHERE expires<=?').run(now);
+        for (const room of this.rooms.values()) await this.presence(room, { persist: true, publish: false });
+      }
     } finally { this.sweeping = false; }
   }
 

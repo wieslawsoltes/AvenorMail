@@ -13,7 +13,7 @@ Avenor's normal Node server exposes `/api/live` on the same HTTP listener as the
 - Journal keys include the exact server WebSocket endpoint, authenticated server user ID, workspace scope, and record ID. The identity comes from the authenticated `ready` frame, not a caller-provided username. Cached bytes are not applied to an editor until the server authorizes its document join. Explicit read-access revocation clears the corresponding stored content and leaves a tombstone that rejects a stale tab's append or late acknowledgment. Session expiration locks editing; reauthentication is required to resume.
 - IndexedDB transactions request strict durability where supported. An unavailable or failed local store locks collaborative editing and reports an error instead of claiming an unsafe save. A navigation guard covers edits whose local transaction is still in flight. Like other browser storage, committed journals depend on the browser retaining the site's data; deleting site storage, private-session teardown, storage eviction, or a device failure is outside that guarantee. Reloaded cached content waits for fresh server authorization, so a fully offline reload cannot reopen a shared rich-text editor until connectivity returns.
 - Presence is ephemeral. The server supplies names and user IDs from authenticated sessions; client-provided names are ignored. Cursor payloads are bounded and checked before forwarding.
-- This hub is designed for one active Node process per database. Multiple processes require a shared CRDT/event transport and cross-process document serialization; running independent in-memory rooms against one SQLite file is unsupported.
+- Multiple Node instances can share a transactional database using `ClusterCoordinator`. CRDT writes read and merge the latest database state under an immediate transaction; durable invalidation events refresh other nodes, and presence has cross-node expiry. See [cluster operation](CLUSTERING.md) for deployment, lease fencing, and verification requirements.
 
 ## Server integration
 
@@ -21,7 +21,8 @@ Avenor's normal Node server exposes `/api/live` on the same HTTP listener as the
 import { RealtimeHub, collaborationDocumentHTML } from './backend/realtime.js';
 
 const live = new RealtimeHub({
-  db, // native node:sqlite DatabaseSync
+  db, // native DatabaseSync or compatible remote libSQL facade
+  coordinator, // optional ClusterCoordinator; see CLUSTERING.md
   authenticate: request => auth.authenticate(request),
   authorize: async ({ user, scope, recordId, action }) => {
     // Check current membership on every invocation.
@@ -30,6 +31,7 @@ const live = new RealtimeHub({
     // write: record is a draft and user may edit it; deny sent/deleted/locked drafts.
     return permissions.check({ user, scope, recordId, action });
   },
+  authorizeWrite: args => currentSynchronousDraftWritePermission(args),
   allowedOrigins: [new URL(env.PUBLIC_URL).origin],
   emit: event => telemetry.record(event), // optional non-blocking notification
 }).migrate().attach(httpServer);
@@ -38,7 +40,7 @@ await live.publish(scope, { type: 'record.updated', recordId });
 await await live.close();
 ```
 
-`authenticate` receives an object inheriting from the original Node `IncomingMessage`, with the first frame's token added to `headers.authorization`. It must return `{userId, email?, displayName?}` or null, and must consult session revocation/expiry. `authorize` returns a boolean and must consult current access rather than client claims.
+`authenticate` receives an object inheriting from the original Node `IncomingMessage`, with the first frame's token added to `headers.authorization`. It must return `{userId, email?, displayName?}` or null, and must consult session revocation/expiry. `authorize` returns a boolean and must consult current access rather than client claims. `authorizeWrite`, when provided, must synchronously revalidate the session and draft permission inside the CRDT write transaction; the application server configures this guard for atomic send-lock and permission enforcement.
 
 `collaborationDocumentHTML(db, recordId)` returns sanitized HTML from the durable CRDT snapshot, or null if no collaboration document exists. API record reads and send snapshots should use this value as the body when available. An ordinary REST body update must never replace that authoritative document. Non-body fields can continue through the existing versioned record API.
 
