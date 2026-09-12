@@ -117,3 +117,7 @@ The archive's append-only/WORM storage and access policy are the operator's resp
 ## Verification
 
 `node --test tests/compliance.test.mjs` exercises real SQLite transactions and trigger rollback; restart migration; record and future-scope holds; grant revocation and cross-scope rejection; literal SQL-injection searches; deterministic encrypted exports; payload/manifest/attachment tamper detection; missing attachments; export/retention races; stale leases; retention and durable object-deletion retries; DLP checks and content-bound acknowledgments; and signed idempotent audit-sink receipts.
+
+## Background calendar delivery
+
+The assembled server applies outbound DLP to generated invitations and native replies as well as composed messages. The calendar part is inspected as text. A blocked or unacknowledged warning prevents provider submission and leaves the durable job in its error/review state. Background jobs do not silently acknowledge a warning on behalf of a user. Correct the content or policy and queue an explicitly reviewed invitation again.

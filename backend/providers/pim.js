@@ -1,4 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+const operationLeases = new AsyncLocalStorage();
+const databaseNow = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
 import { fail, hash, seal, unseal } from './security.js';
 
 const GRAPH = 'https://graph.microsoft.com/v1.0/me';
@@ -166,7 +170,7 @@ export function contactWriteBody(provider, record) {
 /** Durable provider PIM engine. A sync cursor is never advanced until its
  * encrypted batch has been durably applied by the caller and acknowledged. */
 export class PimService {
-  constructor({db,providers,env={},emit=()=>{},now=Date.now}) { this.db=db; this.providers=providers; this.env=env; this.emit=emit; this.now=now; this.instance=randomUUID(); }
+  constructor({db,providers,env={},emit=()=>{},now=Date.now}) { this.db=db; this.providers=providers; this.env=env; this.emit=emit; this.now=now; this.instance=randomUUID(); this.manualLeases=new Map(); }
   migrate() {
     this.db.exec(`CREATE TABLE IF NOT EXISTS provider_pim_state (account_id TEXT PRIMARY KEY,owner TEXT NOT NULL,encrypted_state TEXT NOT NULL,last_sync INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS provider_pim_batches (account_id TEXT PRIMARY KEY,owner TEXT NOT NULL,id TEXT NOT NULL,encrypted_batch TEXT NOT NULL,created_at INTEGER NOT NULL);
@@ -178,15 +182,49 @@ export class PimService {
   readState(account) { const row=this.db.prepare('SELECT * FROM provider_pim_state WHERE account_id=? AND owner=?').get(account.id,account.owner); return row ? unseal(row.encrypted_state,this.env,context(account,'state')) : {known:{},cursors:{},collections:[]}; }
   status(user,id) { const account=this.account(user,id), state=this.readState(account), row=this.db.prepare('SELECT last_sync FROM provider_pim_state WHERE account_id=? AND owner=?').get(id,account.owner); return {collections:state.collections,lastSync:row?.last_sync || null,pendingBatch:!!this.db.prepare('SELECT id FROM provider_pim_batches WHERE account_id=? AND owner=?').get(id,account.owner),pendingWrites:Object.keys(state.writebacks || {}).length,conflicts:Object.entries(state.conflicts || {}).map(([id,value])=>({id,...value,remoteVersion:value.remote.etag || 'sha256:'+hash(JSON.stringify(value.remote))}))}; }
   lock(account) {
-    const now=this.now();
-    const result=this.db.prepare(`INSERT INTO provider_pim_locks(account_id,holder,expires_at) VALUES(?,?,?) ON CONFLICT(account_id) DO UPDATE SET holder=excluded.holder,expires_at=excluded.expires_at WHERE provider_pim_locks.expires_at<?`).run(account.id,this.instance,now+180000,now);
+    // Every operation gets a fresh token: an old operation from this same
+    // service instance must not inherit a successor's renewed ownership.
+    const lease={service:this,accountId:account.id,token:this.instance+':'+randomUUID()};
+    const result=this.db.prepare(`INSERT INTO provider_pim_locks(account_id,holder,expires_at) VALUES(?,?,${databaseNow}+180000) ON CONFLICT(account_id) DO UPDATE SET holder=excluded.holder,expires_at=excluded.expires_at WHERE provider_pim_locks.expires_at<=${databaseNow}`).run(account.id,lease.token);
     if (!result.changes) fail('This account is already synchronizing or saving a calendar/contact change.',409,'pim_busy');
+    this.manualLeases.set(account.id,lease);return lease;
   }
-  unlock(account) { this.db.prepare('DELETE FROM provider_pim_locks WHERE account_id=? AND holder=?').run(account.id,this.instance); }
+  currentLease(account,lease=operationLeases.getStore() || this.manualLeases.get(account.id)) {
+    if(!lease || lease.service!==this || lease.accountId!==account.id)fail('The synchronization lease expired. Start the operation again.',409,'pim_lease_lost');
+    return lease;
+  }
+  assertLease(account,lease) {
+    const current=this.currentLease(account,lease);
+    if(!this.db.prepare(`SELECT 1 FROM provider_pim_locks WHERE account_id=? AND holder=? AND expires_at>${databaseNow}`).get(account.id,current.token))fail('The synchronization lease expired. Start the operation again.',409,'pim_lease_lost');
+  }
+  fenced(account,task,lease) {
+    const current=this.currentLease(account,lease);this.db.exec('SAVEPOINT pim_fence');
+    try{
+      // This conditional write both checks ownership and holds SQLite's write
+      // lock until the result is persisted; a successor cannot race the check.
+      const held=this.db.prepare(`UPDATE provider_pim_locks SET expires_at=expires_at WHERE account_id=? AND holder=? AND expires_at>${databaseNow}`).run(account.id,current.token);
+      if(!held.changes)fail('The synchronization lease expired. Start the operation again.',409,'pim_lease_lost');
+      const result=task();this.assertLease(account,current);this.db.exec('RELEASE pim_fence');return result;
+    }catch(error){this.db.exec('ROLLBACK TO pim_fence; RELEASE pim_fence');throw error;}
+  }
+  unlock(account,lease=this.manualLeases.get(account.id)) {
+    if(!lease)return;
+    this.db.prepare('DELETE FROM provider_pim_locks WHERE account_id=? AND holder=?').run(account.id,lease.token);
+    if(this.manualLeases.get(account.id)?.token===lease.token)this.manualLeases.delete(account.id);
+  }
+  async withLease(account,task) {
+    const lease=this.lock(account);
+    try{return await operationLeases.run(lease,async()=>{this.assertLease(account,lease);const result=await task();try{this.assertLease(account,lease);}catch(error){error.uncertain=true;throw error;}return result;});}
+    finally{this.unlock(account,lease);}
+  }
   async request(user,account,url,init={}) {
-    const renewed=this.db.prepare('UPDATE provider_pim_locks SET expires_at=? WHERE account_id=? AND holder=?').run(this.now()+180000,account.id,this.instance);
-    if (!renewed.changes) fail('The synchronization lease expired. Start the operation again.',409,'pim_lease_lost');
-    return this.providers.cloudRequest(user,account.id,url,{...init,headers:{...(account.provider === 'microsoft' ? graphHeaders : {}),...init.headers}});
+    const lease=this.currentLease(account);
+    const renewed=this.db.prepare(`UPDATE provider_pim_locks SET expires_at=${databaseNow}+180000 WHERE account_id=? AND holder=? AND expires_at>${databaseNow}`).run(account.id,lease.token);
+    if(!renewed.changes)fail('The synchronization lease expired. Start the operation again.',409,'pim_lease_lost');
+    let response;
+    try{response=await this.providers.cloudRequest(user,account.id,url,{...init,headers:{...(account.provider === 'microsoft' ? graphHeaders : {}),...init.headers}});}
+    catch(error){this.assertLease(account,lease);throw error;}
+    this.assertLease(account,lease);return response;
   }
   async pages(user,account,url,{items='value',next='@odata.nextLink',delta='@odata.deltaLink',pageToken=false}={}) {
     const result=[]; let token=null; const visited=new Set();
@@ -202,8 +240,8 @@ export class PimService {
     return {items:result,token};
   }
   async syncAccount(user,id) {
-    const account=this.account(user,id); this.lock(account);
-    try {
+    const account=this.account(user,id);
+    return this.withLease(account,async()=>{
       const pending=this.db.prepare('SELECT * FROM provider_pim_batches WHERE account_id=? AND owner=?').get(id,account.owner);
       if(pending) return this.batchArray(account,pending);
       const state=this.readState(account), next=clone(state), output=new Map(); next.known ||= {}; next.cursors ||= {}; next.aliases ||= {}; next.writebacks ||= {}; next.conflicts ||= {};
@@ -235,20 +273,25 @@ export class PimService {
       const existing=new Set(next.collections.map(c=>c.kind+':'+c.id));
       for(const [recordId,old] of Object.entries(next.known)) if(!existing.has(old.kind+':'+old.collectionId)){output.set(recordId,{...old,id:recordId,deleted:true});delete next.known[recordId];}
       const batch={id:randomUUID(),records:[...output.values()],state:next};
-      this.db.prepare('INSERT INTO provider_pim_batches(account_id,owner,id,encrypted_batch,created_at) VALUES(?,?,?,?,?)').run(id,account.owner,batch.id,seal(batch,this.env,context(account,'batch:'+batch.id)),this.now());
-      return this.batchArray(account,{id:batch.id,encrypted_batch:seal(batch,this.env,context(account,'batch:'+batch.id))});
-    } finally {this.unlock(account);}
+      const encrypted=seal(batch,this.env,context(account,'batch:'+batch.id));
+      this.fenced(account,()=>this.db.prepare('INSERT INTO provider_pim_batches(account_id,owner,id,encrypted_batch,created_at) VALUES(?,?,?,?,?)').run(id,account.owner,batch.id,encrypted,this.now()));
+      return this.batchArray(account,{id:batch.id,encrypted_batch:encrypted});
+    });
   }
   batchArray(account,row) { const batch=unseal(row.encrypted_batch,this.env,context(account,'batch:'+row.id)); Object.defineProperties(batch.records,{batchId:{value:row.id},collections:{value:batch.state.collections}}); return batch.records; }
   acknowledgeSync(user,id,batchId) {
-    const account=this.account(user,id), row=this.db.prepare('SELECT * FROM provider_pim_batches WHERE account_id=? AND owner=?').get(id,account.owner);
-    if(!row)return;
-    if(!batchId || batchId!==row.id)fail('A different calendar/contact batch awaits persistence.',409,'pim_batch_mismatch');
-    const batch=unseal(row.encrypted_batch,this.env,context(account,'batch:'+row.id));
-    this.db.exec('SAVEPOINT pim_ack');
-    try {this.db.prepare('INSERT INTO provider_pim_state(account_id,owner,encrypted_state,last_sync) VALUES(?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET encrypted_state=excluded.encrypted_state,last_sync=excluded.last_sync').run(id,account.owner,seal(batch.state,this.env,context(account,'state')),this.now());this.db.prepare('DELETE FROM provider_pim_batches WHERE account_id=? AND id=?').run(id,batchId);this.db.exec('RELEASE pim_ack');}
-    catch(error){this.db.exec('ROLLBACK TO pim_ack; RELEASE pim_ack');throw error;}
-    try{this.emit(account.owner,{type:'pim-synced',accountId:id});}catch{/* delivery is best effort */}
+    const account=this.account(user,id),lease=this.lock(account);
+    try{
+      const row=this.db.prepare('SELECT * FROM provider_pim_batches WHERE account_id=? AND owner=?').get(id,account.owner);
+      if(!row)return;
+      if(!batchId || batchId!==row.id)fail('A different calendar/contact batch awaits persistence.',409,'pim_batch_mismatch');
+      const batch=unseal(row.encrypted_batch,this.env,context(account,'batch:'+row.id)),encrypted=seal(batch.state,this.env,context(account,'state'));
+      this.fenced(account,()=>{
+        this.db.prepare('INSERT INTO provider_pim_state(account_id,owner,encrypted_state,last_sync) VALUES(?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET encrypted_state=excluded.encrypted_state,last_sync=excluded.last_sync').run(id,account.owner,encrypted,this.now());
+        this.db.prepare('DELETE FROM provider_pim_batches WHERE account_id=? AND id=?').run(id,batchId);
+      },lease);
+      try{this.emit(account.owner,{type:'pim-synced',accountId:id});}catch{/* delivery is best effort */}
+    }finally{this.unlock(account,lease);}
   }
   async syncMicrosoft(user,account,previous,next,add,reconcile) {
     const calendarResult=await this.pages(user,account,GRAPH+'/calendars?$top=250');
@@ -332,7 +375,7 @@ export class PimService {
     if(!['remote','local'].includes(resolution))fail('Choose the provider version or reapply the local version.');
     if(typeof idempotencyKey!=='string'||!/^[A-Za-z0-9:._-]{8,200}$/.test(idempotencyKey))fail('A stable idempotency key is required.');
     const account=this.account(user,accountId),signature=hash(JSON.stringify({recordId,resolution,expectedRemoteEtag})),ctx=context(account,'resolution:'+idempotencyKey);
-    this.lock(account);
+    const lease=this.lock(account);
     let intent;
     try {
       const prior=this.db.prepare('SELECT * FROM provider_pim_resolutions WHERE account_id=? AND owner=? AND idempotency_key=?').get(accountId,account.owner,idempotencyKey);
@@ -348,27 +391,27 @@ export class PimService {
         if(expectedRemoteEtag!==(conflict.remote.etag || 'sha256:'+hash(JSON.stringify(conflict.remote))))fail('The provider conflict changed since review. Review the latest versions first.',409,'pim_review_changed');
         if(resolution==='remote'||conflict.remote.deleted&&conflict.local.deleted){
           const result={...conflict.remote,id:recordId};delete state.conflicts[recordId];delete state.writebacks[recordId];
-          this.db.exec('SAVEPOINT pim_resolve');
-          try{
+          this.fenced(account,()=>{
             this.db.prepare('UPDATE provider_pim_state SET encrypted_state=? WHERE account_id=? AND owner=?').run(seal(state,this.env,context(account,'state')),accountId,account.owner);
-            this.db.prepare("INSERT INTO provider_pim_resolutions(account_id,owner,idempotency_key,payload_hash,status,encrypted_value) VALUES(?,?,?,?,'accepted',?)").run(accountId,account.owner,idempotencyKey,signature,seal(result,this.env,ctx));this.db.exec('RELEASE pim_resolve');
-          }catch(error){this.db.exec('ROLLBACK TO pim_resolve; RELEASE pim_resolve');throw error;}
+            this.db.prepare("INSERT INTO provider_pim_resolutions(account_id,owner,idempotency_key,payload_hash,status,encrypted_value) VALUES(?,?,?,?,'accepted',?)").run(accountId,account.owner,idempotencyKey,signature,seal(result,this.env,ctx));
+          },lease);
           return result;
         }
         const record={...conflict.local,etag:conflict.remote.etag,sourceEtags:conflict.remote.sourceEtags,providerRaw:conflict.remote.providerRaw};
         intent={record,kind:record.kind,method:conflict.local.deleted?'delete':conflict.remote.deleted?'create':'update'};
-        this.db.prepare("INSERT INTO provider_pim_resolutions(account_id,owner,idempotency_key,payload_hash,status,encrypted_value) VALUES(?,?,?,?,'submitting',?)").run(accountId,account.owner,idempotencyKey,signature,seal(intent,this.env,ctx));
+        const encryptedIntent=seal(intent,this.env,ctx);
+        this.fenced(account,()=>this.db.prepare("INSERT INTO provider_pim_resolutions(account_id,owner,idempotency_key,payload_hash,status,encrypted_value) VALUES(?,?,?,?,'submitting',?)").run(accountId,account.owner,idempotencyKey,signature,encryptedIntent),lease);
       }
-    }finally{this.unlock(account);}
+    }finally{this.unlock(account,lease);}
     const result=await this.writeRecord({user,accountId,...intent,idempotencyKey});
-    this.db.prepare("UPDATE provider_pim_resolutions SET status='accepted',encrypted_value=? WHERE account_id=? AND owner=? AND idempotency_key=?").run(seal(result,this.env,ctx),accountId,account.owner,idempotencyKey);
-    return result;
+    try{return await this.withLease(account,async()=>{const encrypted=seal(result,this.env,ctx);this.fenced(account,()=>this.db.prepare("UPDATE provider_pim_resolutions SET status='accepted',encrypted_value=? WHERE account_id=? AND owner=? AND idempotency_key=?").run(encrypted,accountId,account.owner,idempotencyKey));return result;});}catch(error){error.uncertain=true;throw error;}
   }
   async writeRecord({user,accountId,kind,record,method='update',idempotencyKey}){
     if(!['event','contact'].includes(kind)||!['create','update','delete'].includes(method))fail('Unsupported calendar/contact operation.');
     if(!record||typeof record!=='object'||Array.isArray(record))fail('A calendar/contact record is required.');
     if(typeof idempotencyKey!=='string'||!/^[A-Za-z0-9:._-]{8,200}$/.test(idempotencyKey))fail('A stable idempotency key is required.');
-    const account=this.account(user,accountId),signature=hash(JSON.stringify({kind,record,method}));this.lock(account);
+    const account=this.account(user,accountId),signature=hash(JSON.stringify({kind,record,method}));
+    return this.withLease(account,async()=>{
     let submitted=false;
     try{
       const prior=this.db.prepare('SELECT * FROM provider_pim_writes WHERE account_id=? AND owner=? AND idempotency_key=?').get(accountId,account.owner,idempotencyKey);
@@ -412,7 +455,7 @@ export class PimService {
           }else url+='?'+new URLSearchParams({personFields:PERSON_FIELDS});
         }
       }
-      this.db.prepare(`INSERT INTO provider_pim_writes(account_id,owner,idempotency_key,payload_hash,status,updated_at) VALUES(?,?,?,?,'submitting',?) ON CONFLICT(account_id,owner,idempotency_key) DO UPDATE SET status='submitting',updated_at=excluded.updated_at`).run(accountId,account.owner,idempotencyKey,signature,this.now());
+      this.fenced(account,()=>this.db.prepare(`INSERT INTO provider_pim_writes(account_id,owner,idempotency_key,payload_hash,status,updated_at) VALUES(?,?,?,?,'submitting',?) ON CONFLICT(account_id,owner,idempotency_key) DO UPDATE SET status='submitting',updated_at=excluded.updated_at`).run(accountId,account.owner,idempotencyKey,signature,this.now()));
       submitted=true;
       const response=await this.request(user,account,url,{method:httpMethod,headers:{...(body?{'Content-Type':'application/json'}:{}),...(method!=='create'?{'If-Match':record.etag}:{})},...(body?{body:JSON.stringify(body)}:{})});
       const normalized=method==='delete'?{...record,deleted:true}:{...(kind==='event'?normalizeEvent(account.provider,response,collection):normalizeContact(account.provider,response,collection)),accountId,provider:account.provider};
@@ -424,20 +467,21 @@ export class PimService {
       state.writebacks[normalized.id]={record:normalized,acceptedAt:this.now()};delete state.conflicts[normalized.id];
       if(method==='delete')delete state.known[normalized.id];else state.known[normalized.id]={kind,collectionId,providerId:normalized.providerId,accountId,provider:account.provider};
       if(!state.collections.some(c=>c.kind===kind&&c.id===collectionId))state.collections.push(collection);
-      this.db.exec('SAVEPOINT pim_write_accept');
-      try{
-        this.db.prepare("UPDATE provider_pim_writes SET status='accepted',encrypted_result=?,updated_at=? WHERE account_id=? AND owner=? AND idempotency_key=?").run(seal(normalized,this.env,context(account,'write:'+idempotencyKey)),this.now(),accountId,account.owner,idempotencyKey);
-        this.db.prepare('INSERT INTO provider_pim_state(account_id,owner,encrypted_state,last_sync) VALUES(?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET encrypted_state=excluded.encrypted_state').run(accountId,account.owner,seal(state,this.env,context(account,'state')),0);
-        this.db.exec('RELEASE pim_write_accept');
-      }catch(error){this.db.exec('ROLLBACK TO pim_write_accept; RELEASE pim_write_accept');throw error;}
+      const encryptedResult=seal(normalized,this.env,context(account,'write:'+idempotencyKey)),encryptedState=seal(state,this.env,context(account,'state'));
+      this.fenced(account,()=>{
+        this.db.prepare("UPDATE provider_pim_writes SET status='accepted',encrypted_result=?,updated_at=? WHERE account_id=? AND owner=? AND idempotency_key=?").run(encryptedResult,this.now(),accountId,account.owner,idempotencyKey);
+        this.db.prepare('INSERT INTO provider_pim_state(account_id,owner,encrypted_state,last_sync) VALUES(?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET encrypted_state=excluded.encrypted_state').run(accountId,account.owner,encryptedState,0);
+      });
       return normalized;
     }catch(error){
       if(submitted){const status=errorStatus(error),rejected=status>=400&&status<500&&status!==408;
-        this.db.prepare('UPDATE provider_pim_writes SET status=?,updated_at=? WHERE account_id=? AND owner=? AND idempotency_key=?').run(rejected?'rejected':'unknown',this.now(),accountId,account.owner,idempotencyKey);
+        try{this.fenced(account,()=>this.db.prepare('UPDATE provider_pim_writes SET status=?,updated_at=? WHERE account_id=? AND owner=? AND idempotency_key=?').run(rejected?'rejected':'unknown',this.now(),accountId,account.owner,idempotencyKey));}
+        catch(leaseError){leaseError.uncertain=true;throw leaseError;}
         if(status===412 || account.provider==='google'&&kind==='contact'&&method==='update'&&status===400)throw Object.assign(new Error('The provider record changed or rejected the contact version. Synchronize and merge your changes.'),{status:409,code:'pim_version_conflict'});
         if(!rejected)error.uncertain=true;
       }
       throw error;
-    }finally{this.unlock(account);}
+    }
+    });
   }
 }

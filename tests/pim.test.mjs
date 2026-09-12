@@ -150,3 +150,60 @@ test('Microsoft series reconciliation imports full exception objects and cancele
   return graphBase(url);
  });const batch=await pim.syncAccount(user,'account');assert.deepEqual(batch.find(e=>e.providerId==='master').exclusionDates,['2026-09-19']);assert.equal(batch.find(e=>e.providerId==='special').seriesMasterId,'master');assert.equal(batch.find(e=>e.providerId==='special').originalStart,'2026-09-26T09:00:00Z');db.close();
 });
+
+test('a stale final sync response cannot replace a successor batch, cursor, or lease',async()=>{
+ let release,started;const ready=new Promise(resolve=>{started=resolve;});
+ const {pim,db}=setup('google',async url=>{if(url.pathname.endsWith('/connections')){started();return new Promise(resolve=>{release=()=>resolve(googleBase(url));});}return googleBase(url);});
+ const first=pim.syncAccount(user,'account');const rejected=assert.rejects(first,e=>e.code==='pim_lease_lost');await ready;
+ db.prepare('UPDATE provider_pim_locks SET expires_at=0 WHERE account_id=?').run('account');
+ const successor=setup('google',url=>googleBase(url,{events:{items:[gEvent('successor')]}}),db);
+ const next=await successor.pim.syncAccount(user,'account');successor.pim.acknowledgeSync(user,'account',next.batchId);
+ const snapshot=db.prepare('SELECT encrypted_state FROM provider_pim_state').get().encrypted_state;
+ const lease=successor.pim.lock(successor.providers.account(user,'account'));
+ release();await rejected;
+ assert.equal(db.prepare('SELECT encrypted_state FROM provider_pim_state').get().encrypted_state,snapshot);
+ assert.equal(db.prepare('SELECT holder FROM provider_pim_locks').get().holder,lease.token);
+ assert.equal(db.prepare('SELECT count(*) AS n FROM provider_pim_batches').get().n,0);
+ successor.pim.unlock(successor.providers.account(user,'account'),lease);db.close();
+});
+
+test('a stale accepted write cannot persist data or alter successor receipts and remains uncertain',async()=>{
+ let release,started;const ready=new Promise(resolve=>{started=resolve;});
+ const {pim,db}=setup('google',async()=>{started();return new Promise(resolve=>{release=()=>resolve(gContact('first',{etag:'first-accepted'}));});});
+ const input={user,accountId:'account',kind:'contact',method:'create',record:{name:'First'},idempotencyKey:'stale-write-first'};
+ const first=pim.writeRecord(input),rejected=assert.rejects(first,e=>e.code==='pim_lease_lost'&&e.uncertain===true);await ready;
+ db.prepare('UPDATE provider_pim_locks SET expires_at=0').run();
+ const successor=setup('google',()=>gContact('second',{etag:'second-accepted'}),db);
+ const accepted=await successor.pim.writeRecord({...input,record:{name:'Second'},idempotencyKey:'successor-write-second'});
+ const snapshot=db.prepare('SELECT encrypted_state FROM provider_pim_state').get().encrypted_state;
+ const lease=successor.pim.lock(successor.providers.account(user,'account'));
+ release();await rejected;
+ assert.equal(db.prepare('SELECT encrypted_state FROM provider_pim_state').get().encrypted_state,snapshot);
+ assert.equal(db.prepare('SELECT status FROM provider_pim_writes WHERE idempotency_key=?').get('stale-write-first').status,'submitting');
+ assert.equal(db.prepare('SELECT status FROM provider_pim_writes WHERE idempotency_key=?').get('successor-write-second').status,'accepted');
+ assert.equal(successor.pim.readState(successor.providers.account(user,'account')).known[accepted.id].providerId,'people/second');
+ assert.equal(db.prepare('SELECT holder FROM provider_pim_locks').get().holder,lease.token);
+ successor.pim.unlock(successor.providers.account(user,'account'),lease);db.close();
+});
+
+test('expired ownership cannot renew itself, including overlapping operations from one service instance',async()=>{
+ let release,started,first=true;const ready=new Promise(resolve=>{started=resolve;});
+ const {pim,db,providers}=setup('google',async url=>{if(first&&url.pathname.endsWith('/connections')){first=false;started();return new Promise(resolve=>{release=()=>resolve(googleBase(url));});}return googleBase(url);});
+ const pending=pim.syncAccount(user,'account'),rejected=assert.rejects(pending,e=>e.code==='pim_lease_lost');await ready;
+ const old=db.prepare('SELECT holder FROM provider_pim_locks').get().holder;
+ db.prepare('UPDATE provider_pim_locks SET expires_at=0').run();
+ const successor=await pim.syncAccount(user,'account');pim.acknowledgeSync(user,'account',successor.batchId);
+ const lease=pim.lock(providers.account(user,'account'));assert.notEqual(lease.token,old);release();await rejected;
+ assert.equal(db.prepare('SELECT holder FROM provider_pim_locks').get().holder,lease.token);
+ db.prepare('UPDATE provider_pim_locks SET expires_at=0').run();
+ await assert.rejects(pim.request(user,providers.account(user,'account'),'https://people.googleapis.com/v1/people/me/connections'),e=>e.code==='pim_lease_lost');
+ assert.equal(db.prepare('SELECT expires_at FROM provider_pim_locks').get().expires_at,0);pim.unlock(providers.account(user,'account'),lease);db.close();
+});
+
+test('a final response that outlives the lease cannot persist even without a successor',async()=>{
+ let release,started;const ready=new Promise(resolve=>{started=resolve;});
+ const {pim,db}=setup('google',async url=>{if(url.pathname.endsWith('/connections')){started();return new Promise(resolve=>{release=()=>resolve(googleBase(url));});}return googleBase(url);});
+ const pending=pim.syncAccount(user,'account'),rejected=assert.rejects(pending,e=>e.code==='pim_lease_lost');await ready;
+ db.prepare('UPDATE provider_pim_locks SET expires_at=0').run();release();await rejected;
+ assert.equal(db.prepare('SELECT count(*) AS n FROM provider_pim_batches').get().n,0);assert.equal(db.prepare('SELECT count(*) AS n FROM provider_pim_state').get().n,0);db.close();
+});

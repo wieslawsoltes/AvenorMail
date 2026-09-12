@@ -1,4 +1,4 @@
-import {flowText, TextMeasurer} from './scene-text.js';
+import {flowText, TextMeasurer, fontString} from './scene-text.js';
 import {intersectClip, hitTestScene} from './gpu-workspace.js';
 
 const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
@@ -31,7 +31,7 @@ export function layoutScene(tree, {width = 1000, height = 700, measureText, meas
     const w = bounded(length(node.style?.width, allocation.width, allocation.width), node.style?.minWidth, node.style?.maxWidth);
     let h = length(node.style?.height, allocation.height, allocation.forcedHeight);
     const contentWidth = Math.max(0, w - pl - pr), gap = finite(node.style?.gap), paddingTop = pt;
-    const itemStart = items.length, ownItems = [], children = [...(node.children || [])].filter(child => child.style?.display !== 'none');
+    const itemStart = items.length, semanticStart = semantics.length, ownItems = [], children = [...(node.children || [])].filter(child => child.style?.display !== 'none');
     const shapes = [...parentShapes];
     const provisional = {x, y, width: w, height: h ?? allocation.height};
     const clip = h !== undefined && (node.style?.overflow === 'hidden' || node.style?.overflow === 'scroll') ? intersectClip(parentClip, provisional) : parentClip;
@@ -113,11 +113,12 @@ export function layoutScene(tree, {width = 1000, height = 700, measureText, meas
     if (node.style?.overflow === 'hidden' || node.style?.overflow === 'scroll') {
       const finalClip = intersectClip(parentClip, bounds), rounded = finite(node.style?.radius) ? {...bounds, radius: finite(node.style.radius)} : null;
       for (let index = itemStart; index < items.length; index++) { items[index].clip = intersectClip(items[index].clip, finalClip); if (rounded && index >= childStart) items[index].clipShapes = [...items[index].clipShapes, rounded]; }
+      for (let index = semanticStart; index < semantics.length; index++) semantics[index].clip = intersectClip(semantics[index].clip, finalClip);
     }
     if (ownItems[0]?.type === 'rect') ownItems[0].height = h;
     if (node.id !== undefined) {
       nodes.set(node.id, {node, bounds, contentHeight: contentHeight + pt + pb, clip: intersectClip(parentClip, bounds)});
-      if (node.role || node.label || node.editable) semantics.push({id: node.id, role: node.role || (node.editable ? 'textbox' : 'group'), label: node.label || node.text || '', ...bounds, clip: intersectClip(parentClip, bounds), value: node.value ?? node.text, editable: node.editable, multiline: node.multiline, disabled: node.disabled, checked: node.checked, pressed: node.pressed, onActivate: node.onActivate, onInput: node.onInput, tabIndex: node.tabIndex});
+      if (node.role || node.label || node.editable) semantics.push({id: node.id, role: node.role || (node.editable ? 'textbox' : 'group'), label: node.label || node.text || '', ...bounds, clip: intersectClip(parentClip, bounds), textStyle: inheritable, padding: [pt, pr, pb, pl], value: node.value ?? node.text, editable: node.editable, multiline: node.multiline, disabled: node.disabled, checked: node.checked, pressed: node.pressed, onActivate: node.onActivate, onInput: node.onInput, tabIndex: node.tabIndex});
       if (common.interactive && !items.slice(itemStart).some(item => item.id === node.id)) items.splice(itemStart, 0, {...common, ...bounds, type: 'rect', color: [0, 0, 0, 0]});
     }
     return bounds;
@@ -147,7 +148,7 @@ export class SemanticOverlay {
     this.layer = this.document.createElement('div'); this.layer.style.cssText = 'position:absolute;inset:0;pointer-events:none'; container.append(this.layer);
   }
   sync(scene) {
-    const present = new Set();
+    const present = new Set(), ordered = [];
     for (const semantic of scene.semantics || []) {
       present.add(semantic.id); let control = this.controls.get(semantic.id);
       const tag = semantic.editable ? semantic.multiline ? 'textarea' : 'input' : semantic.role === 'button' ? 'button' : 'div';
@@ -164,6 +165,11 @@ export class SemanticOverlay {
         this.controls.set(semantic.id, control); this.layer.append(control);
       }
       control._semantic = semantic; control.style.pointerEvents = semantic.editable || semantic.onActivate || ['button', 'checkbox', 'link', 'menuitem', 'tab'].includes(semantic.role) ? 'auto' : 'none'; control.setAttribute('role', semantic.role); control.setAttribute('aria-label', semantic.label); control.tabIndex = semantic.disabled ? -1 : semantic.tabIndex ?? (semantic.editable || ['button', 'checkbox', 'link', 'menuitem', 'tab'].includes(semantic.role) ? 0 : -1);
+      if (semantic.editable) {
+        const style = semantic.textStyle || {}; control.style.font = fontString(style); control.style.lineHeight = (style.lineHeight || (style.fontSize || 14) * 1.4) + 'px';
+        control.style.padding = (semantic.padding || [0]).map(value => value + 'px').join(' '); control.style.direction = style.direction || 'ltr'; control.style.resize = 'none';
+        control.style.letterSpacing = (parseFloat(style.letterSpacing) || 0) + 'px'; control.style.wordSpacing = (parseFloat(style.wordSpacing) || 0) + 'px';
+      }
       control.setAttribute('aria-disabled', String(!!semantic.disabled)); if ('disabled' in control) control.disabled = !!semantic.disabled;
       for (const property of ['checked', 'pressed']) if (semantic[property] !== undefined) control.setAttribute('aria-' + property, String(semantic[property])); else control.removeAttribute('aria-' + property);
       for (const property of ['width', 'height']) control.style[property] = Math.max(0, semantic[property]) + 'px'; control.style.left = semantic.x + 'px'; control.style.top = semantic.y + 'px';
@@ -171,9 +177,16 @@ export class SemanticOverlay {
         const clip = semantic.clip; control.style.clipPath = `inset(${Math.max(0, clip.y - semantic.y)}px ${Math.max(0, semantic.x + semantic.width - clip.x - clip.width)}px ${Math.max(0, semantic.y + semantic.height - clip.y - clip.height)}px ${Math.max(0, clip.x - semantic.x)}px)`;
         if (!clip.width || !clip.height) { control.tabIndex = -1; control.setAttribute('aria-hidden', 'true'); } else control.removeAttribute('aria-hidden');
       }
+      ordered.push(control);
       if (semantic.editable && !control._composing && this.document.activeElement !== control && control.value !== String(semantic.value ?? '')) control.value = semantic.value ?? '';
     }
     for (const [id, control] of this.controls) if (!present.has(id)) { control.remove(); this.controls.delete(id); }
+    let anchor = null;
+    for (const control of ordered.reverse()) {
+      // Reorder siblings around an active editor rather than detaching its IME/focus state.
+      if (control !== this.document.activeElement && control.nextSibling !== anchor) this.layer.insertBefore(control, anchor);
+      anchor = control;
+    }
   }
   input(control) { control._semantic.onInput?.(control.value); this.onInput(control._semantic.id, control.value); }
   focus(id) { this.controls.get(id)?.focus(); }

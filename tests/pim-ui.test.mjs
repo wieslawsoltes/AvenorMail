@@ -27,9 +27,18 @@ test('shared mailbox search and attach forms use the chosen parent account and e
  form=document.querySelector('[data-advanced="provider-shared-attach"]');await ui.submit(form,{accountId:'microsoft',email:'team@example.com'});assert.deepEqual(JSON.parse(requests[1].init.body),{email:'team@example.com'});dom.window.close();
 });
 test('provider conflict resolution requires a reviewed version and maintains one key across retry',async()=>{
- const conflict={id:'local-event',local:{title:'My edit',etag:'local'},remote:{title:'External edit',etag:'remote'}};let fail=true;
+ const conflict={id:'local-event',version:7,local:{title:'My edit',etag:'local'},remote:{title:'External edit',etag:'remote'}};let fail=true;
  const {ui,requests,dom}=setup(async(path)=>{if(path.endsWith('/conflicts')&&fail)throw Error('Temporary failure');return {collections:[],conflicts:[conflict]};});
  const target=encodeURIComponent(JSON.stringify(['google','local-event']));await assert.rejects(ui.action('pim-resolve-local',target),/Review/);await ui.action('pim-conflict',target);
  assert.match(document.querySelector('#modal').textContent,/My edit/);assert.match(document.querySelector('#modal').textContent,/External edit/);
- await assert.rejects(ui.action('pim-resolve-local',target),/Temporary/);fail=false;await ui.action('pim-resolve-local',target);const submits=requests.filter(r=>r.path.endsWith('/conflicts'));assert.equal(submits[0].init.headers['Idempotency-Key'],submits[1].init.headers['Idempotency-Key']);assert.equal(JSON.parse(submits[0].init.body).resolution,'local');dom.window.close();
+ await assert.rejects(ui.action('pim-resolve-local',target),/Temporary/);fail=false;await ui.action('pim-resolve-local',target);const submits=requests.filter(r=>r.path.endsWith('/conflicts'));assert.equal(submits[0].init.headers['Idempotency-Key'],submits[1].init.headers['Idempotency-Key']);assert.equal(JSON.parse(submits[0].init.body).resolution,'local');assert.equal(JSON.parse(submits[0].init.body).version,7);dom.window.close();
+});
+test('provider/local CAS recovery submits the reviewed local version and provider token',async()=>{
+ const conflict={recordId:'local-event',version:12,status:'accepted_local_conflict',local:{title:'Local edit'},provider:{title:'Provider accepted edit',etag:'"accepted"'},expectedRemoteEtag:'"accepted"'};
+ let fail=true;const {ui,requests,dom}=setup(async(path)=>{if(path.endsWith('/recover')&&fail)throw Error('Connection lost');return {collections:[],localConflicts:[conflict]};});
+ const target=encodeURIComponent(JSON.stringify(['google','local-event']));await assert.rejects(ui.action('pim-recover-provider',target),/Review/);
+ await ui.action('pim-status','google');assert.match(document.querySelector('#modal').textContent,/Provider results to reconcile/);
+ await ui.action('pim-local-conflict',target);assert.match(document.querySelector('#modal').textContent,/Local edit/);assert.match(document.querySelector('#modal').textContent,/Provider accepted edit/);
+ await assert.rejects(ui.action('pim-recover-provider',target),/Connection lost/);fail=false;await ui.action('pim-recover-provider',target);
+ const recovery=requests.filter(r=>r.path.endsWith('/recover'));const payload=JSON.parse(recovery[0].init.body);assert.equal(payload.resolution,'provider');assert.equal(payload.version,12);assert.equal(payload.expectedRemoteEtag,'"accepted"');assert.equal(recovery[0].init.headers['Idempotency-Key'],recovery[1].init.headers['Idempotency-Key']);dom.window.close();
 });

@@ -1,4 +1,5 @@
 import test from 'node:test';
+import {simpleParser} from 'mailparser';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -370,4 +371,59 @@ test('message routes reject server-managed provider metadata and imported accoun
   assert.ok([400,403].includes(reassigned.status), JSON.stringify(reassigned.data));
   assert.equal(f.read(imported.id).accountId,account.id); assert.equal(f.read(imported.id).providerId,'trusted-remote-id');
   assert.equal(f.db.prepare("SELECT count(*) AS n FROM jobs WHERE type='provider_mutation'").get().n,0);
+});
+
+test('metadata-only mailbox reconciliation preserves MIME and attachment references', async t => {
+ const f=await fixture(t),account=f.providers.add(f.admin.user);
+ f.providers.nextMessages=[{id:'mail-metadata',providerId:'uid-7',subject:'Original MIME',body:'<p>Keep the body</p>',from:'sender@example.net',folder:'inbox',attachments:[{name:'report.txt',type:'text/plain',bytes:Buffer.from('private attachment')}]}];
+ await f.app.ingest(f.app.auth.user(f.admin.user.id),account.id);const original=f.read('mail-metadata');
+ f.providers.nextMessages=[{id:'mail-metadata',providerId:'uid-7',metadataOnly:true,read:true,flagged:true,folder:'archive'}];
+ await f.app.ingest(f.app.auth.user(f.admin.user.id),account.id);const result=f.read('mail-metadata');
+ assert.equal(result.body,original.body);assert.equal(result.subject,original.subject);assert.deepEqual(result.attachments,original.attachments);assert.equal(result.folder,'archive');assert.equal(result.read,true);assert.equal(result.metadataOnly,undefined);
+ const response=await f.app.handle(new Request(PUBLIC_URL+'/api/file/'+original.attachments[0].id,{headers:{authorization:'Bearer '+f.admin.token}}));assert.equal(response.status,200);assert.equal(await response.text(),'private attachment');
+});
+
+test('provider tombstones preserve legal-held records while acknowledging synchronization', async t => {
+ const f=await fixture(t),account=f.providers.add(f.admin.user),scope='user:'+f.admin.user.id;
+ f.providers.nextMessages=[{id:'held-mail',providerId:'remote-held',folder:'inbox',body:'Evidence'}];await f.app.ingest(f.app.auth.user(f.admin.user.id),account.id);
+ await f.as(f.admin,'policies',{method:'POST',body:{scope,retentionDays:0,legalHold:true}});
+ f.providers.nextMessages=[{id:'held-mail',deleted:true}];await f.app.ingest(f.app.auth.user(f.admin.user.id),account.id);
+ assert.equal(f.read('held-mail').deleted,0);assert.equal(f.providers.acks.length,2);assert.equal(f.app.compliance.verifyRevisions().valid,true);
+});
+
+test('outbound DLP blocks before submission and warnings require a content-bound acknowledgment', async t => {
+ const f=await fixture(t),account=f.providers.add(f.admin.user),scope='user:'+f.admin.user.id;
+ const record=await f.create(f.admin,'message',draft({accountId:account.id}));
+ const policy={internalDomains:['example.com'],rules:[{id:'external',name:'External recipient',action:'warn',match:{externalOnly:true}}]};
+ assert.equal((await f.as(f.admin,'compliance/dlp',{method:'POST',body:{scope,version:0,policy}})).status,200);
+ const send=body=>f.as(f.admin,'send',{method:'POST',body:{id:record.id,version:f.read(record.id).version,accountId:account.id,...body}});
+ const warning=await send({});assert.equal(warning.status,409);assert.equal(warning.data.code,'dlp_warning');assert.ok(warning.data.acknowledgment);assert.equal(f.providers.sent.length,0);assert.equal(f.read(record.id).delivery,undefined);
+ await f.as(f.admin,'record',{method:'PATCH',body:{id:record.id,version:record.version,patch:{body:'Changed after review'}}});
+ const stale=await send({acknowledged:[warning.data.acknowledgment]});assert.equal(stale.status,409);assert.notEqual(stale.data.acknowledgment,warning.data.acknowledgment);
+ const accepted=await send({acknowledged:[stale.data.acknowledgment]});assert.equal(accepted.status,200);assert.equal(f.providers.sent.length,1);
+ const blocked=await f.create(f.admin,'message',draft({accountId:account.id}));
+ await f.as(f.admin,'compliance/dlp',{method:'POST',body:{scope,version:1,policy:{...policy,rules:[{id:'external',action:'block',match:{externalOnly:true}}]}}});
+ const failed=await f.as(f.admin,'send',{method:'POST',body:{id:blocked.id,version:blocked.version,accountId:account.id}});assert.equal(failed.status,422);assert.equal(f.read(blocked.id).folder,'drafts');assert.equal(f.providers.sent.length,1);
+});
+
+test('native inbound meeting requests are reviewed, displayed and answered through durable delivery', async t => {
+ const f=await fixture(t),account=f.providers.add(f.admin.user),user=f.app.auth.user(f.admin.user.id);
+ const calendar=['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//Avenor test//EN','METHOD:REQUEST','BEGIN:VEVENT','UID:backend-inbound','SEQUENCE:1','DTSTAMP:20260912T120000Z','DTSTART:20300101T100000Z','DTEND:20300101T110000Z','SUMMARY:Integration meeting','ORGANIZER:mailto:organizer@example.net','ATTENDEE;RSVP=TRUE:mailto:admin@example.com','END:VEVENT','END:VCALENDAR',''].join('\r\n');
+ f.providers.nextMessages=[{id:'inbound-mail',providerId:'native-request',internetMessageId:'<calendar@example.net>',folder:'inbox',from:'organizer@example.net',body:'Meeting invite',calendarParts:[{content:calendar}]}];
+ await f.app.ingest(user,account.id);
+ let list=await f.as(f.admin,'calendar/inbound?status=all');assert.equal(list.status,200);const item=list.data.messages[0];assert.equal(item.status,'review');
+ const reviewed=await f.as(f.admin,'calendar/inbound/'+item.id+'/review',{method:'POST',body:{decision:'accept'}});assert.equal(reviewed.status,200);
+ const event=f.db.prepare("SELECT * FROM records WHERE kind='event'").get();assert.ok(event);assert.equal(JSON.parse(event.data).calendarInboxId,item.id);
+ const forbidden=await f.as(f.admin,'record',{method:'PATCH',body:{id:event.id,version:event.version,patch:{title:'Rewrite organizer title'}}});assert.equal(forbidden.status,403);
+ const reply=await f.as(f.admin,'calendar/inbound/'+item.id+'/respond',{method:'POST',body:{response:'accepted'}});assert.equal(reply.status,202);
+ await f.app.scheduler.runDue();assert.equal(f.providers.sent.length,1);const parsed=await simpleParser(f.providers.sent[0].mime);const replyContent=parsed.attachments.find(a=>a.contentType==='text/calendar').content.toString();assert.match(replyContent,/METHOD:REPLY/);assert.match(replyContent,/PARTSTAT=ACCEPTED/);
+});
+
+test('background calendar messages cannot bypass outbound protection policy',async t=>{
+ const f=await fixture(t),account=f.providers.add(f.admin.user),scope='user:'+f.admin.user.id;
+ const event=await f.create(f.admin,'event',{title:'Protected meeting',start:'2030-01-01T10:00:00Z',end:'2030-01-01T11:00:00Z',attendees:'external@example.net',notes:'Confidential agenda'});
+ await f.as(f.admin,'compliance/dlp',{method:'POST',body:{scope,version:0,policy:{internalDomains:['example.com'],rules:[{id:'calendar-external',action:'block',match:{externalOnly:true}}]}}});
+ const queued=await f.as(f.admin,'invitations',{method:'POST',body:{eventId:event.id,version:event.version,accountId:account.id,method:'REQUEST'}});assert.equal(queued.status,202);
+ await f.app.scheduler.runDue();assert.equal(f.providers.sent.length,0);
+ const job=f.db.prepare("SELECT * FROM jobs WHERE type='invitation-delivery'").get();assert.notEqual(job.status,'completed');assert.notEqual(job.status,'accepted');
 });

@@ -107,7 +107,7 @@ test('native semantic overlay keeps focus, selection and IME composition across 
   const scene = {semantics: [{id: 'edit', role: 'textbox', editable: true, label: 'Message', value: 'start', x: 10, y: 20, width: 100, height: 30}, {id: 'send', role: 'button', label: 'Send', x: 120, y: 20, width: 60, height: 30}]};
   overlay.sync(scene); const input = overlay.controls.get('edit'); overlay.focus('edit'); input.setSelectionRange(1, 3);
   input.dispatchEvent(new dom.window.CompositionEvent('compositionstart')); input.value = '日本'; input.dispatchEvent(new dom.window.Event('input')); overlay.sync(scene);
-  assert.equal(input.value, '日本'); assert.equal(inputs.length, 0); assert.equal(overlay.controls.get('edit'), input);
+  assert.equal(input.value, '日本'); assert.equal(inputs.length, 0); assert.equal(overlay.controls.get('edit'), input); assert.equal(dom.window.document.activeElement, input);
   input.dispatchEvent(new dom.window.CompositionEvent('compositionend')); assert.deepEqual(inputs, [['edit', '日本']]);
   overlay.controls.get('send').click(); assert.deepEqual(activations, ['send']); assert.equal(input.getAttribute('aria-label'), 'Message');
   overlay.sync({semantics: []}); assert.equal(overlay.controls.size, 0); overlay.dispose();

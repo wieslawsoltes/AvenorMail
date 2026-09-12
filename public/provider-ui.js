@@ -1,6 +1,6 @@
 /** Provider management UI. All reads/writes use the host app's authenticated API. */
 export function createProviderUI({api,S,runtime,e,btn,field,select,modal,advancedModal,notify,load,loadAccounts,render,closeModal,upsert}) {
-  const statusCache=new Map(),conflictCache=new Map(),sharedCache=new Map(),operationKeys=new Map(),busy=new Set();
+  const statusCache=new Map(),conflictCache=new Map(),recoveryCache=new Map(),sharedCache=new Map(),operationKeys=new Map(),busy=new Set();
   const cloudAccounts=()=> (S.accounts || []).filter(a=>a.provider==='microsoft'||a.provider==='google');
   const accountById=id=>cloudAccounts().find(a=>a.id===id);
   const hidden=(name,value)=>`<input type="hidden" name="${e(name)}" value="${e(value)}">`;
@@ -15,14 +15,15 @@ export function createProviderUI({api,S,runtime,e,btn,field,select,modal,advance
     if(!runtime.connected)return '';
     return `<div class="settings-card"><h3>Calendars, contacts & shared mailboxes</h3><p>Keep your provider calendars and address books together in Avenor. Changes to connected records are saved back to their provider.</p>${cloudAccounts().map(a=>{
       const data=statusCache.get(a.id);
-      return `<div class="rule-row" style="align-items:flex-start;flex-wrap:wrap"><div style="min-width:180px;flex:1"><strong>${e(a.displayName || a.email)}</strong><p>${e(a.email)}${a.parentAccountId?' · Shared mailbox':''}${data?.lastSync?' · Synced '+e(new Date(data.lastSync).toLocaleString()):''}</p>${data?.pendingWrites?`<p class="form-hint">${Number(data.pendingWrites)} accepted change${data.pendingWrites===1?' is':'s are'} waiting to appear in provider synchronization.</p>`:''}${data?.conflicts?.length?`<p class="error-inline">${data.conflicts.length} provider conflict${data.conflicts.length===1?'':'s'} need review.</p>`:''}</div><div class="team-tools">${btn('pim-sync:'+a.id,'Sync calendar & contacts','refresh','secondary')}${btn('pim-status:'+a.id,'Manage','settings','secondary')}${a.provider==='microsoft'&&!a.parentAccountId?btn('provider-shared:'+a.id,'Shared mailboxes','people','secondary'):''}</div></div>`;
+      return `<div class="rule-row" style="align-items:flex-start;flex-wrap:wrap"><div style="min-width:180px;flex:1"><strong>${e(a.displayName || a.email)}</strong><p>${e(a.email)}${a.parentAccountId?' · Shared mailbox':''}${data?.lastSync?' · Synced '+e(new Date(data.lastSync).toLocaleString()):''}</p>${data?.pendingWrites?`<p class="form-hint">${Number(data.pendingWrites)} accepted change${data.pendingWrites===1?' is':'s are'} waiting to appear in provider synchronization.</p>`:''}${data?.conflicts?.length||data?.localConflicts?.length?`<p class="error-inline">${(data.conflicts?.length||0)+(data.localConflicts?.length||0)} provider change(s) need review.</p>`:''}</div><div class="team-tools">${btn('pim-sync:'+a.id,'Sync calendar & contacts','refresh','secondary')}${btn('pim-status:'+a.id,'Manage','settings','secondary')}${a.provider==='microsoft'&&!a.parentAccountId?btn('provider-shared:'+a.id,'Shared mailboxes','people','secondary'):''}</div></div>`;
     }).join('')||'<p class="form-hint">Connect Microsoft or Google above to start. SMTP/IMAP accounts provide email only.</p>'}</div>`;
   }
   async function showStatus(id){
     const account=accountById(id);if(!account)throw Error('Connected account not found.');
     const data=await status(id);
     const conflicts=(data.conflicts || []).map(c=>{const target=token(id,c.id);conflictCache.set(target,c);return `<div class="rule-row"><div><strong>${e(c.local?.title || c.local?.name || 'Provider change')}</strong><p>The provider version differs from the accepted local change.</p></div>${btn('pim-conflict:'+target,'Review versions','edit','secondary')}</div>`;}).join('');
-    modal('Calendars & contacts',`<p>${e(account.email)}</p>${collectionMarkup(data)}${data.pendingWrites?`<p class="form-hint">${Number(data.pendingWrites)} accepted change${data.pendingWrites===1?' is':'s are'} waiting for provider synchronization. Your accepted edits remain visible until the provider confirms them.</p>`:''}${conflicts?'<h4>Changes to review</h4>'+conflicts:''}<div class="team-tools">${btn('pim-publish-event:'+id,'Publish a local event','calendar','secondary')}${btn('pim-publish-contact:'+id,'Publish a local contact','people','secondary')}</div>`,btn('close-modal','Close',null,'secondary')+btn('pim-sync:'+id,'Synchronize','refresh','primary'));
+    const recoveries=(data.localConflicts || []).map(c=>{const target=token(id,c.recordId);recoveryCache.set(target,c);return `<div class="rule-row"><div><strong>${e(c.local?.title || c.local?.name || c.provider?.title || c.provider?.name || 'Accepted provider change')}</strong><p>The provider result and local version need reconciliation.</p></div>${btn('pim-local-conflict:'+target,'Review recovery','edit','secondary')}</div>`;}).join('');
+    modal('Calendars & contacts',`<p>${e(account.email)}</p>${collectionMarkup(data)}${data.pendingWrites?`<p class="form-hint">${Number(data.pendingWrites)} accepted change${data.pendingWrites===1?' is':'s are'} waiting for provider synchronization. Your accepted edits remain visible until the provider confirms them.</p>`:''}${conflicts?'<h4>Changes to review</h4>'+conflicts:''}${recoveries?'<h4>Provider results to reconcile</h4>'+recoveries:''}<div class="team-tools">${btn('pim-publish-event:'+id,'Publish a local event','calendar','secondary')}${btn('pim-publish-contact:'+id,'Publish a local contact','people','secondary')}</div>`,btn('close-modal','Close',null,'secondary')+btn('pim-sync:'+id,'Synchronize','refresh','primary'));
   }
   async function showPublish(id,kind){
     const account=accountById(id);if(!account)throw Error('Connected account not found.');
@@ -57,8 +58,18 @@ export function createProviderUI({api,S,runtime,e,btn,field,select,modal,advance
       case 'pim-resolve-local':case 'pim-resolve-remote':{
         const [id,recordId]=unpack(value);if(!conflictCache.has(value))throw Error('Review this conflict before resolving it.');
         const resolution=name==='pim-resolve-local'?'local':'remote',key=keyFor(name+':'+value);
-        const result=await api('pim/'+encodeURIComponent(id)+'/conflicts',{method:'POST',headers:{'Idempotency-Key':key},body:JSON.stringify({recordId,resolution,idempotencyKey:key,expectedRemoteEtag:conflictCache.get(value).remoteVersion || conflictCache.get(value).remote?.etag})});
+        const result=await api('pim/'+encodeURIComponent(id)+'/conflicts',{method:'POST',headers:{'Idempotency-Key':key},body:JSON.stringify({recordId,resolution,version:conflictCache.get(value).version ?? (S.records || []).find(r=>r.id===recordId)?.version,idempotencyKey:key,expectedRemoteEtag:conflictCache.get(value).remoteVersion || conflictCache.get(value).remote?.etag})});
         if(result.record || result.id)upsert(result.record || result);operationKeys.delete(name+':'+value);conflictCache.delete(value);await status(id);await closeModal();await load();notify('Provider conflict resolved');break;
+      }
+      case 'pim-local-conflict':{
+        const [id,recordId]=unpack(value),data=await status(id),conflict=data.localConflicts?.find(c=>c.recordId===recordId);if(!conflict)throw Error('This provider result has already been reconciled.');recoveryCache.set(value,conflict);
+        modal('Recover provider change',`<p>A provider operation completed while the local record changed. Review both versions before reconciling the result.</p><h4>Current local version ${e(conflict.version)}</h4><pre class="pending-json">${e(JSON.stringify(shortRecord(conflict.local),null,2))}</pre><h4>Provider result</h4><pre class="pending-json">${e(JSON.stringify(shortRecord(conflict.provider),null,2))}</pre>${!conflict.provider?'<p class="note-box">The provider outcome is still unconfirmed. Check the provider account before attempting another operation.</p>':''}`,btn('close-modal','Keep for review',null,'secondary')+(conflict.provider?btn('pim-recover-provider:'+value,'Use provider result',null,'secondary')+btn('pim-recover-local:'+value,'Reapply current local version',null,'primary'):''));break;
+      }
+      case 'pim-recover-provider':case 'pim-recover-local':{
+        const [id,recordId]=unpack(value),conflict=recoveryCache.get(value);if(!conflict)throw Error('Review this provider result before recovery.');
+        const resolution=name==='pim-recover-local'?'local':'provider',key=keyFor(name+':'+value);
+        const result=await api('pim/'+encodeURIComponent(id)+'/recover',{method:'POST',headers:{'Idempotency-Key':key},body:JSON.stringify({recordId,resolution,version:conflict.version,expectedRemoteEtag:conflict.expectedRemoteEtag,idempotencyKey:key})});
+        if(result.record || result.id)upsert(result.record || result);operationKeys.delete(name+':'+value);recoveryCache.delete(value);await status(id);await closeModal();await load();notify('Provider and local record reconciled');break;
       }
       case 'provider-shared':showSharedResults(value,null);break;
       case 'provider-shared-attach':{

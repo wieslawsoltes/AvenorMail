@@ -355,7 +355,7 @@ export class InboundCalendarService {
     calendar.addSubcomponent(component);
     const subject = `${reply.partstat}: ${event.title}`, text = `${reply.mailbox_email} ${reply.partstat.toLowerCase()} ${event.title}.`;
     const raw = calendarMime({ from: reply.mailbox_email, to: event.organizer, subject, text, calendar: calendar.toString(), method: 'REPLY', id: context.idempotencyKey, now: reply.stamp });
-    const result = await this.deliver({ user, accountId: reply.account_id, to: event.organizer, subject, text, calendar: calendar.toString(), raw, idempotencyKey: context.idempotencyKey, signal: context.signal, markAccepted: context.markAccepted });
+    const result = await this.deliver({ user, scope: record.scope, recordId: record.id, accountId: reply.account_id, to: event.organizer, subject, text, calendar: calendar.toString(), raw, idempotencyKey: context.idempotencyKey, signal: context.signal, markAccepted: context.markAccepted });
     if (['accepted', 'completed'].includes(result?.status)) {
       this.db.prepare("UPDATE inbound_calendar_outgoing SET status='accepted' WHERE id=?").run(replyId);
       const latest = this.db.prepare('SELECT * FROM records WHERE id=?').get(record.id);

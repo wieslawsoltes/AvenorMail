@@ -163,7 +163,7 @@ export class InvitationService {
     const calendar = calendarIcs({ event, uid: invitation.uid, sequence: payload.sequence, organizer: invitation.organizer, attendees, method, now: this.now() });
     const subject = `${method === 'CANCEL' ? 'Cancelled: ' : 'Invitation: '}${event.title}`, text = `${subject}\n${event.start} – ${event.end}\n${event.location || ''}\n\n${event.notes || ''}${responseUrl ? `\n\nReview and respond: ${responseUrl}\nOpening the link does not send a response.` : ''}`;
     const raw = calendarMime({ from: invitation.organizer, to: payload.email, subject, text, calendar, method, id: context.idempotencyKey, now: this.now() });
-    const result = await this.deliver({ user, accountId: invitation.account_id, to: payload.email, subject, text, calendar, raw, idempotencyKey: context.idempotencyKey, signal: context.signal, markAccepted: context.markAccepted });
+    const result = await this.deliver({ user, scope: invitation.scope, recordId: invitation.event_id, accountId: invitation.account_id, to: payload.email, subject, text, calendar, raw, idempotencyKey: context.idempotencyKey, signal: context.signal, markAccepted: context.markAccepted });
     return result || { status: 'unknown' };
   }
 
@@ -175,7 +175,7 @@ export class InvitationService {
     const event = JSON.parse(invitation.snapshot), calendar = calendarIcs({ event, uid: invitation.uid, sequence: payload.sequence, organizer: invitation.organizer, attendees: [{ email: payload.email, partstat: payload.partstat }], method: 'REPLY', now: this.now() });
     const subject = `${payload.partstat}: ${event.title}`, text = `${payload.email} responded ${payload.partstat.toLowerCase()} to ${event.title}.\n\nThis RSVP was confirmed ${payload.via === 'token' ? 'using the recipient’s invitation link' : 'by the signed-in workspace attendee'}.`;
     const raw = calendarMime({ from: invitation.organizer, to: invitation.organizer, subject, text, calendar, method: 'REPLY', id: context.idempotencyKey, now: this.now() });
-    return await this.deliver({ user, accountId: invitation.account_id, to: invitation.organizer, subject, text, calendar, raw, idempotencyKey: context.idempotencyKey, signal: context.signal, markAccepted: context.markAccepted }) || { status: 'unknown' };
+    return await this.deliver({ user, scope: invitation.scope, recordId: invitation.event_id, accountId: invitation.account_id, to: invitation.organizer, subject, text, calendar, raw, idempotencyKey: context.idempotencyKey, signal: context.signal, markAccepted: context.markAccepted }) || { status: 'unknown' };
   }
 
   async respond(invitation, attendee, response, via) {

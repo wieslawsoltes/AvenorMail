@@ -4,7 +4,7 @@
 
 `public/` is the browser application. `scripts/build-pages.mjs` bundles its dependencies with esbuild into `pages/`, copies the other modules, and stamps the service-worker cache with a content hash. `backend/server.js` exposes HTTP, WebSockets, static hosting, authentication and background services. It reuses `server/engine.js` for the record model and internal delivery. `drizzle/0000_warm_stick.sql` is the initial schema; backend modules add their own tables idempotently. No Drizzle runtime is required.
 
-The Pages interface defaults to a browser-local workspace and only contacts a backend after the user enters its origin. It never stores OAuth/SMTP credentials. The server owns SQLite and attachment files under `DATA_DIR` and requires a persistent `DATA_KEY` before startup. Losing the key loses access to encrypted credentials and file contents. Run **one active Node process per SQLite database**; the WebSocket document cache and provider locks are process-local.
+The Pages interface defaults to a browser-local workspace and only contacts a backend after the user enters its origin. It never stores OAuth/SMTP credentials. The server owns SQLite and attachment files under `DATA_DIR` and requires a persistent `DATA_KEY` before startup. Losing the key loses access to encrypted credentials and file contents. Multiple processes use database event delivery, fenced provider/job leases and transactional CRDT merges. Set `WEB_CONCURRENCY` for the included supervisor. SQLite WAL may be shared only by processes on the same host; for multiple hosts use a shared libSQL writer endpoint and encrypted S3 attachments. See [clustering](CLUSTERING.md) for topology, failure semantics and deployment requirements.
 
 ## Hosting
 
