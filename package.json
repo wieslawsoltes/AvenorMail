@@ -14,6 +14,9 @@
     "build:pages": "node scripts/build-pages.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1127.0",
+    "@libsql/client": "^0.18.0",
+    "ical.js": "^2.2.1",
     "imapflow": "^1.7.8",
     "jose": "^6.2.12",
     "mailparser": "^3.9.20",
@@ -31,12 +34,12 @@
     "yjs": "^13.6.32"
   },
   "devDependencies": {
-    "esbuild": "^0.28.2",
-    "fake-indexeddb": "^6.2.5",
-    "jsdom": "^30.0.1",
-    "eslint": "9.39.4",
     "@eslint/js": "9.39.4",
-    "globals": "^16.5.0"
+    "esbuild": "^0.28.2",
+    "eslint": "9.39.4",
+    "fake-indexeddb": "^6.2.5",
+    "globals": "^16.5.0",
+    "jsdom": "^30.0.1"
   },
   "type": "module",
   "packageManager": "pnpm@11.25.0"
