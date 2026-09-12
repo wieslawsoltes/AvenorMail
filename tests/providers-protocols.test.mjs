@@ -104,6 +104,7 @@ function imapFixture(t, { uidValidity = 77n, uids = [1, 2, 3], source, size } = 
     this.secureConnection = true;
     this.mailbox = { exists: uids.length, uidValidity };
   });
+  t.mock.method(ImapFlow.prototype, 'list', async () => [{path:'INBOX',flags:new Set()}]);
   t.mock.method(ImapFlow.prototype, 'getMailboxLock', async (mailbox, options) => {
     calls.mailbox = mailbox; calls.lockOptions = options;
     return { release() { calls.released = true; } };
@@ -190,9 +191,10 @@ test('IMAP does not retry an ambiguous MOVE or claim its target UID', async t =>
 test('IMAP batches advance only imported UIDs and require read-only encrypted connection', async (t) => {
   const calls = imapFixture(t, { uids: [9, 1, 7, 2, 2] });
   const result = await syncImap(config({ imap: { port: 143 } }), { uidValidity: '77', lastUid: 1 }, { PROVIDER_SYNC_LIMIT: '2' });
-  assert.deepEqual(result.cursor, { uidValidity: '77', lastUid: 7 });
-  assert.deepEqual(result.messages.map((message) => message.providerId), ['imap:INBOX:77:2', 'imap:INBOX:77:7']);
-  assert.equal(calls.query.uid, '2:*');
+  assert.equal(result.cursor.schemaVersion,3);
+  assert.equal(result.cursor.cycle.uidIndex,2);
+  assert.deepEqual(result.messages.map((message) => message.providerId), ['imap:INBOX:77:1', 'imap:INBOX:77:2']);
+  assert.equal(calls.query.all,true);
   assert.equal(calls.options.doSTARTTLS, true);
   assert.equal(calls.options.tls.rejectUnauthorized, true);
   assert.deepEqual(calls.lockOptions, { readOnly: true });
@@ -206,15 +208,17 @@ test('IMAP batches advance only imported UIDs and require read-only encrypted co
 test('IMAP UIDVALIDITY changes reset incremental position', async (t) => {
   const calls = imapFixture(t, { uidValidity: 88n, uids: [1] });
   const result = await syncImap(config(), { uidValidity: '77', lastUid: 900 }, {});
-  assert.equal(calls.query.uid, '1:*');
-  assert.deepEqual(result.cursor, { uidValidity: '88', lastUid: 1 });
+  assert.equal(calls.query.all,true);
+  assert.equal(result.cursor.schemaVersion,3);
+  assert.ok(result.cursor.entries['imap:INBOX:88:1']);
 });
 
-test('IMAP n:* fallback never duplicates already imported messages', async (t) => {
+test('IMAP reconciliation rechecks known UIDs without reimporting unchanged content', async (t) => {
   imapFixture(t, { uids: [9] });
-  const result = await syncImap(config(), { uidValidity: '77', lastUid: 9 }, {});
+  const initial = await syncImap(config(), null, {});
+  const result = await syncImap(config(), initial.cursor, {});
   assert.deepEqual(result.messages, []);
-  assert.equal(result.cursor.lastUid, 9);
+  assert.equal(result.cursor.cycle,null);
 });
 
 test('IMAP parses MIME attachment bytes and plain text safely', async (t) => {

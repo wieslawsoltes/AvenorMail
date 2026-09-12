@@ -1,11 +1,12 @@
 import { lookup } from 'node:dns/promises';
+import { createHash } from 'node:crypto';
 import { BlockList, isIP } from 'node:net';
 import { domainToASCII } from 'node:url';
 import { checkServerIdentity } from 'node:tls';
 import nodemailer from 'nodemailer';
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
-import { validateMessagePatch } from './mutations.js';
+import { isImapFolder, validateMessagePatch } from './mutations.js';
 
 const privateAddresses = new BlockList();
 for (const [address, prefix] of [
@@ -180,11 +181,14 @@ export async function parseMailSource(source, maxBytes = 25 * 1024 * 1024) {
   return parsed;
 }
 
-function normalizedMessage(parsed, source, uidValidity) {
+function normalizedMessage(parsed, source, uidValidity, mailbox = 'INBOX', folder = 'inbox') {
   const from = addressList(parsed.from)[0];
   const date = [parsed.date, source.internalDate].find((value) => value && Number.isFinite(new Date(value).getTime()));
   return {
-    providerId: `imap:INBOX:${uidValidity}:${source.uid}`,
+    providerId: imapProviderId(mailbox, uidValidity, source.uid),
+    internetMessageId: parsed.messageId || null,
+    providerMailbox: mailbox,
+    calendarParts: calendarParts(parsed),
     from: from?.address || '',
     name: from?.name || from?.address || '',
     to: addressList(parsed.to).map((entry) => entry.address).join(', '),
@@ -195,9 +199,11 @@ function normalizedMessage(parsed, source, uidValidity) {
     // provider HTML as the application's display body.
     body: parsed.text || '',
     date: new Date(date || Date.now()).toISOString(),
-    folder: 'inbox',
+    folder,
     read: source.flags?.has('\\Seen') || false,
     flagged: source.flags?.has('\\Flagged') || false,
+    answered: source.flags?.has('\\Answered') || false,
+    providerFlags: [...(source.flags || [])].sort(),
     attachments: (parsed.attachments || []).map((attachment, index) => ({
       name: attachment.filename || `attachment-${index + 1}`,
       type: attachment.contentType || 'application/octet-stream',
@@ -206,82 +212,170 @@ function normalizedMessage(parsed, source, uidValidity) {
   };
 }
 
-/** Import new INBOX messages in ascending UID order without skipping batch overflow. */
+/** Preserve scheduling MIME for a separate validation and consent pipeline. */
+export function calendarParts(parsed) {
+  return (parsed.attachments || []).filter(a => a.contentType?.toLowerCase() === 'text/calendar').map(a => ({
+    content: Buffer.from(a.content).toString('utf8'),
+    method: a.headers?.get('content-type')?.params?.method || null,
+  }));
+}
+
+export function imapProviderId(mailbox, validity, uid) {
+  return mailbox.toUpperCase() === 'INBOX' ? `imap:INBOX:${validity}:${uid}` :
+    `imap:v2:${Buffer.from(mailbox).toString('base64url')}:${validity}:${uid}`;
+}
+
+const imapFolder = box => {
+  if (box.path.toUpperCase() === 'INBOX') return 'inbox';
+  for (const [flag, folder] of [['\\Sent','sent'],['\\Drafts','drafts'],['\\Trash','deleted'],['\\Junk','junk'],['\\Archive','archive']]) {
+    if (box.flags?.has(flag)) return folder;
+  }
+  return `imap:${Buffer.from(box.path).toString('base64url')}`;
+};
+const goodUid = uid => Number.isInteger(uid) && uid > 0 && uid <= 0xffffffff;
+const safeMailbox = path => typeof path === 'string' && path && path.length <= 1024 && ![...path].some(c=>c.charCodeAt(0)<32 || c.charCodeAt(0)===127);
+
+/**
+ * Bounded, restartable reconciliation across every selectable mailbox.
+ * The snapshot is a membership list, never a sequence-number checkpoint. Source
+ * removals are emitted only after the complete pass so a verified unique move
+ * can retain the original local record identity before the old UID disappears.
+ */
+export async function reconcileImap(client, previous = null, env = {}) {
+  const cursor = previous?.schemaVersion === 3 ? structuredClone(previous) : { schemaVersion: 3, entries: {}, cycle: null };
+  cursor.entries ||= {};
+  const limit = envLimit(env.PROVIDER_SYNC_LIMIT, 100, 500);
+  const maxBytes = envLimit(env.PROVIDER_MESSAGE_MAX_BYTES, 25 * 1024 * 1024, 100 * 1024 * 1024);
+  const batchMaxBytes = envLimit(env.PROVIDER_SYNC_MAX_BYTES, 50 * 1024 * 1024, 200 * 1024 * 1024);
+  const maximumUids = envLimit(env.PROVIDER_IMAP_MAX_UIDS, 250000, 2000000);
+  const messages = [];
+  let examined = 0, batchBytes = 0;
+  const boxes = (await client.list()).filter(box => safeMailbox(box.path) && !box.flags?.has('\\Noselect') && !box.flags?.has('\\NonExistent'));
+  if (!boxes.length && Object.keys(cursor.entries).length) throw new MailProtocolError('MAIL_SYNC_FAILED','No selectable mailboxes were returned; existing mail is preserved.');
+  if (boxes.length > 1000) throw new MailProtocolError('MAIL_FOLDER_LIMIT', 'The mailbox has more than 1,000 selectable folders.', 413);
+  boxes.sort((a,b)=>(a.path.toUpperCase()==='INBOX'?-1:b.path.toUpperCase()==='INBOX'?1:a.path.localeCompare(b.path)));
+  const directory = boxes.map(box=>({path:box.path,folder:imapFolder(box)}));
+  const sameDirectory = items => JSON.stringify(directory) === JSON.stringify(items.map(({path,folder})=>({path,folder})));
+  if (cursor.cycle && !sameDirectory(cursor.cycle.folders)) cursor.cycle=null;
+  if (cursor.building && !sameDirectory(cursor.building.directory)) cursor.building=null;
+  if (!cursor.cycle) {
+    cursor.building ||= {directory,folders:[],index:0,total:0};
+    const building=cursor.building, folderLimit=envLimit(env.PROVIDER_IMAP_FOLDER_BATCH_LIMIT,25,1000);
+    let selected=0;
+    // Folder membership itself is paginated and durable. No partial directory
+    // snapshot can produce tombstones before every folder has been checked.
+    while (building.index < directory.length && selected++ < folderLimit) {
+      const box=directory[building.index];
+      const lock=await client.getMailboxLock(box.path,{readOnly:true});
+      try {
+        const validity=String(client.mailbox.uidValidity);
+        if (!/^\d+$/.test(validity)) throw new MailProtocolError('MAIL_SYNC_FAILED','The mail server did not provide a stable mailbox identifier.');
+        const found=client.mailbox.exists?await client.search({all:true},{uid:true}):[];
+        if (!Array.isArray(found)) throw new MailProtocolError('MAIL_SYNC_FAILED','The mail server did not return a complete UID membership list.');
+        const uids=[...new Set(found.filter(goodUid))].sort((a,b)=>a-b);
+        if (found.some(uid=>!goodUid(uid))) throw new MailProtocolError('MAIL_SYNC_FAILED','The mail server returned an invalid UID.');
+        building.total+=uids.length;
+        if (building.total>maximumUids) throw new MailProtocolError('MAIL_UID_LIMIT','The mailbox exceeds the configured reconciliation membership limit.',413);
+        building.folders.push({...box,validity,uids});building.index++;
+      } finally {lock.release();}
+    }
+    if (building.index<directory.length) return {messages,cursor,folders:directory,more:true};
+    const folders=building.folders;
+    const present=new Set(folders.flatMap(box=>box.uids.map(uid=>imapProviderId(box.path,box.validity,uid))));
+    cursor.cycle={folders,folderIndex:0,uidIndex:0,deletions:Object.keys(cursor.entries).filter(id=>!present.has(id)),deleteIndex:0};
+    delete cursor.building;
+  }
+  const cycle = cursor.cycle;
+  const retire = new Set(cycle.deletions);
+  while (cycle.folderIndex < cycle.folders.length && examined < limit) {
+    const box = cycle.folders[cycle.folderIndex];
+    const lock = await client.getMailboxLock(box.path, { readOnly: true });
+    try {
+      if (String(client.mailbox.uidValidity) !== box.validity) {
+        cursor.cycle = null;
+        return { messages, cursor, folders: cycle.folders.map(({ path, folder }) => ({ path, folder })), more: true };
+      }
+      while (cycle.uidIndex < box.uids.length && examined < limit) {
+        const uid = box.uids[cycle.uidIndex], providerId = imapProviderId(box.path, box.validity, uid);
+        const known = cursor.entries[providerId];
+        const query = { uid: true, flags: true, emailId: true, ...(known?.digest ? {} : { internalDate: true, size: true, source: { start: 0, maxLength: maxBytes + 1 } }) };
+        const source = await client.fetchOne(uid, query, { uid: true });
+        examined++;
+        if (!source) {
+          if (known && !retire.has(providerId)) { cycle.deletions.push(providerId); retire.add(providerId); }
+          cycle.uidIndex++; continue;
+        }
+        if (source.uid !== uid || !(source.flags instanceof Set)) throw new MailProtocolError('MAIL_SYNC_FAILED', 'A mail message could not be retrieved consistently.');
+        const read = source.flags.has('\\Seen'), flagged = source.flags.has('\\Flagged'), markedDeleted = source.flags.has('\\Deleted');
+        const providerFlags=[...source.flags].sort(),answered=source.flags.has('\\Answered');
+        if (known?.digest) {
+          if (known.read !== read || known.flagged !== flagged || known.markedDeleted !== markedDeleted || known.folder !== box.folder || JSON.stringify(known.providerFlags)!==JSON.stringify(providerFlags)) {
+            messages.push({ providerId, metadataOnly: true, folder: box.folder, providerMailbox: box.path, read, flagged, markedDeleted, answered, providerFlags });
+          }
+          Object.assign(known, { read, flagged, markedDeleted, folder: box.folder, providerFlags });
+        } else {
+          if (!source.source) throw new MailProtocolError('MAIL_SYNC_FAILED', 'The mail server omitted message content.');
+          if (source.size > maxBytes || source.source.length > maxBytes) {
+            if (messages.length) return { messages, cursor, more: true };
+            throw new MailProtocolError('MAIL_MESSAGE_TOO_LARGE', 'A message exceeds the configured import size limit.', 413);
+          }
+          if (batchBytes + source.source.length > batchMaxBytes) {
+            if (messages.length) return {messages,cursor,more:true};
+            throw new MailProtocolError('MAIL_MESSAGE_TOO_LARGE','A message exceeds the configured batch size limit.',413);
+          }
+          const digest = createHash('sha256').update(source.source).digest('hex');
+          const parsed = await parseMailSource(source.source, maxBytes);
+          const message = normalizedMessage(parsed, source, box.validity, box.path, box.folder);
+          message.markedDeleted = markedDeleted;
+          // Raw content is compared only against locations proven absent from
+          // this complete membership snapshot. Identical live copies remain
+          // separate records. Ambiguous matches are never merged.
+          const candidates = cycle.deletions.filter(id => cursor.entries[id]?.digest === digest);
+          if (candidates.length === 1) {
+            const oldId = candidates[0];
+            message.previousProviderId = oldId;
+            delete cursor.entries[oldId];
+          }
+          cursor.entries[providerId] = { mailbox: box.path, validity: box.validity, uid, digest,
+            emailId: source.emailId || null, read, flagged, markedDeleted, folder: box.folder, providerFlags };
+          messages.push(message); batchBytes += source.source.length;
+        }
+        cycle.uidIndex++;
+      }
+    } finally { lock.release(); }
+    if (cycle.uidIndex >= box.uids.length) { cycle.folderIndex++; cycle.uidIndex = 0; }
+  }
+  if (cycle.folderIndex >= cycle.folders.length) {
+    while (cycle.deleteIndex < cycle.deletions.length && messages.length < limit) {
+      const id = cycle.deletions[cycle.deleteIndex++], entry = cursor.entries[id];
+      if (!entry) continue;
+      messages.push({ providerId: id, deleted: true, folder: entry.folder, providerMailbox: entry.mailbox });
+      delete cursor.entries[id];
+    }
+    if (cycle.deleteIndex >= cycle.deletions.length) {
+      cursor.folders = cycle.folders.map(({ path, folder }) => ({ path, folder }));
+      cursor.cycle = null; cursor.completedAt = Date.now();
+    }
+  }
+  return { messages, cursor, folders: cursor.folders || cycle.folders.map(({ path, folder }) => ({ path, folder })), more: Boolean(cursor.cycle) };
+}
+
+/** Open a TLS-enforced connection and produce an unacknowledged sync batch. */
 export async function syncImap(input, cursor = null, env = process.env) {
   const config = validateMailConfig(input, env);
   const host = await resolveDestination(config.imap.host, env);
-  const client = new ImapFlow({
-    host,
-    port: config.imap.port,
-    secure: config.imap.secure,
-    ...(config.imap.secure ? {} : { doSTARTTLS: true }),
-    servername: isIP(config.imap.host) ? undefined : config.imap.host,
-    tls: tlsOptions(config.imap.host),
-    auth: { user: config.imap.user, pass: config.imap.password },
-    logger: false,
-    logRaw: false,
-    disableAutoIdle: true,
-    disableCompression: true,
-    connectionTimeout: 15000,
-    greetingTimeout: 15000,
-    socketTimeout: 30000,
-  });
-  // ImapFlow also emits connection failures; consume these so they do not
-  // become unhandled process errors. Awaited commands still reject safely.
+  const client = new ImapFlow({ host, port: config.imap.port, secure: config.imap.secure,
+    ...(config.imap.secure ? {} : { doSTARTTLS: true }), servername: isIP(config.imap.host) ? undefined : config.imap.host,
+    tls: tlsOptions(config.imap.host), auth: { user: config.imap.user, pass: config.imap.password },
+    logger: false, logRaw: false, disableAutoIdle: true, disableCompression: true,
+    connectionTimeout: 15000, greetingTimeout: 15000, socketTimeout: 30000 });
   client.on('error', () => {});
-  let lock;
   try {
     await client.connect();
     if (!client.secureConnection) throw new MailProtocolError('MAIL_TLS_FAILED', 'The mail server did not establish an encrypted connection.');
-    lock = await client.getMailboxLock('INBOX', { readOnly: true });
-    const uidValidity = String(client.mailbox.uidValidity);
-    if (!/^\d+$/.test(uidValidity)) throw new MailProtocolError('MAIL_SYNC_FAILED', 'The mail server did not provide a stable mailbox identifier.');
-    const previousUid = cursor && String(cursor.uidValidity) === uidValidity && Number.isSafeInteger(cursor.lastUid) && cursor.lastUid >= 0 ? cursor.lastUid : 0;
-    let lastUid = previousUid;
-    const messages = [];
-    const limit = envLimit(env.PROVIDER_SYNC_LIMIT, 100, 500);
-    const maxBytes = envLimit(env.PROVIDER_MESSAGE_MAX_BYTES, 25 * 1024 * 1024, 100 * 1024 * 1024);
-    const batchMaxBytes = envLimit(env.PROVIDER_SYNC_MAX_BYTES, 50 * 1024 * 1024, 200 * 1024 * 1024);
-    let batchBytes = 0;
-    if (client.mailbox.exists && previousUid < 0xffffffff) {
-      const matches = await client.search({ uid: `${previousUid + 1}:*` }, { uid: true });
-      // IMAP's n:* range may also return the last message when n exceeds its
-      // UID. Filter explicitly before selecting the next bounded batch.
-      const uids = [...new Set(Array.isArray(matches) ? matches : [])]
-        .filter((uid) => Number.isSafeInteger(uid) && uid > previousUid)
-        .sort((a, b) => a - b).slice(0, limit);
-      for (const uid of uids) {
-        const source = await client.fetchOne(uid, {
-          uid: true,
-          flags: true,
-          internalDate: true,
-          size: true,
-          source: { start: 0, maxLength: maxBytes + 1 },
-        }, { uid: true });
-        if (!source) { lastUid = uid; continue; } // Expunged after the search.
-        if (!source.source || source.uid !== uid) throw new MailProtocolError('MAIL_SYNC_FAILED', 'A mail message could not be retrieved.');
-        if (source.size > maxBytes || source.source.length > maxBytes) {
-          // Return earlier completed messages first. Never silently skip the
-          // oversized message or advance the cursor past unimported content.
-          if (messages.length) break;
-          throw new MailProtocolError('MAIL_MESSAGE_TOO_LARGE', 'A message exceeds the configured import size limit.', 413);
-        }
-        if (messages.length && batchBytes + source.source.length > batchMaxBytes) break;
-        const parsed = await parseMailSource(source.source, maxBytes);
-        messages.push(normalizedMessage(parsed, source, uidValidity));
-        batchBytes += source.source.length;
-        lastUid = uid;
-      }
-    }
-    return { messages, cursor: { uidValidity, lastUid } };
-  } catch (error) {
-    throw safeProviderError(error, 'imap');
-  } finally {
-    lock?.release();
-    // This is a short-lived read-only connection; close avoids an additional
-    // unbounded LOGOUT wait after a failed command or successful import.
-    client.close();
-  }
+    return await reconcileImap(client, cursor, env);
+  } catch (error) { throw safeProviderError(error, 'imap'); }
+  finally { client.close(); }
 }
 
 /** Submit prebuilt MIME once. Acceptance is SMTP server acceptance, not receipt. */
@@ -360,8 +454,9 @@ export async function updateImap(input, providerId, inputPatch, env = process.en
     if (patch.folder) {
       const special = { archive: '\\Archive', deleted: '\\Trash', junk: '\\Junk', drafts: '\\Drafts', sent: '\\Sent' };
       const mailboxes = await client.list();
+      const explicitPath = isImapFolder(patch.folder) ? Buffer.from(patch.folder.slice(5),'base64url').toString('utf8') : null;
       const candidates = mailboxes.filter(box => !box.flags?.has('\\Noselect') && !box.flags?.has('\\NonExistent') &&
-        (patch.folder === 'inbox' ? box.path?.toUpperCase() === 'INBOX' : box.flags?.has(special[patch.folder])));
+        (explicitPath ? box.path === explicitPath : patch.folder === 'inbox' ? box.path?.toUpperCase() === 'INBOX' : box.flags?.has(special[patch.folder])));
       // Do not guess localized names or accept ImapFlow's name heuristics for
       // a destructive-looking action. Require an unambiguous server flag.
       if (candidates.length !== 1) throw new MailProtocolError('MAIL_FOLDER_UNSUPPORTED', 'The IMAP server did not advertise one unambiguous destination for this folder.', 409);

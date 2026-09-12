@@ -1,5 +1,11 @@
 import { fail } from './security.js';
 
+export function isImapFolder(value) {
+  if (typeof value !== 'string' || !/^imap:[A-Za-z0-9_-]{1,1400}$/.test(value)) return false;
+  const path=Buffer.from(value.slice(5),'base64url').toString('utf8');
+  return path.length>0 && path.length<=1024 && ![...path].some(c=>c.charCodeAt(0)<32 || c.charCodeAt(0)===127) && Buffer.from(path).toString('base64url')===value.slice(5);
+}
+
 export const MUTABLE_FOLDERS = new Set(['inbox', 'archive', 'deleted', 'junk', 'drafts', 'sent']);
 
 export function validateMessagePatch(patch) {
@@ -15,7 +21,7 @@ export function validateMessagePatch(patch) {
     }
   }
   if (Object.hasOwn(patch, 'folder')) {
-    if (!MUTABLE_FOLDERS.has(patch.folder)) fail('This folder cannot be synchronized to the provider.', 400, 'provider_mutation_unsupported');
+    if (!MUTABLE_FOLDERS.has(patch.folder) && !isImapFolder(patch.folder)) fail('This folder cannot be synchronized to the provider.', 400, 'provider_mutation_unsupported');
     normalized.folder = patch.folder;
   }
   return normalized;
@@ -25,6 +31,7 @@ const graphFolders = { inbox: 'inbox', archive: 'archive', deleted: 'deleteditem
 const jsonHeaders = { 'Content-Type': 'application/json', Prefer: 'IdType="ImmutableId"' };
 
 export async function updateGraphMessage(api, providerId, patch) {
+  if (isImapFolder(patch.folder)) fail('An IMAP folder cannot be used for a Microsoft mailbox.',400,'provider_mutation_unsupported');
   const target = `https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(providerId)}`;
   const fields = {};
   if (patch.read !== undefined) fields.isRead = patch.read;
@@ -46,6 +53,7 @@ export async function updateGraphMessage(api, providerId, patch) {
 }
 
 export async function updateGmailMessage(api, providerId, patch) {
+  if (isImapFolder(patch.folder)) fail('An IMAP folder cannot be used for a Gmail mailbox.',400,'provider_mutation_unsupported');
   if (['drafts','sent'].includes(patch.folder)) fail('Gmail assigns Draft and Sent automatically; messages cannot be moved into those folders.', 400, 'provider_mutation_unsupported');
   const target = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(providerId)}`;
   const current = await api(`${target}?format=minimal`);

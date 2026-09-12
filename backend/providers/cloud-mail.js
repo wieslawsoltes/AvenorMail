@@ -1,7 +1,7 @@
 import nodemailer from 'nodemailer';
 import { boundedResponse } from './oauth.js';
 import { fail, hash } from './security.js';
-import { parseMailSource } from './mail-protocols.js';
+import { calendarParts, parseMailSource } from './mail-protocols.js';
 
 const GRAPH = 'https://graph.microsoft.com/v1.0';
 const GMAIL = 'https://gmail.googleapis.com/gmail/v1/users/me';
@@ -16,6 +16,7 @@ export async function parseMessage(raw, metadata = {}) {
   const parsed = await parseMailSource(raw);
   return {
     providerId: metadata.providerId,
+    internetMessageId: parsed.messageId || null, calendarParts: calendarParts(parsed),
     from: parsed.from?.value?.[0]?.address || '', name: parsed.from?.value?.[0]?.name || parsed.from?.value?.[0]?.address || '',
     to: addresses(parsed.to), cc: addresses(parsed.cc), bcc: addresses(parsed.bcc),
     subject: parsed.subject || '', body: parsed.text || '',
@@ -94,13 +95,14 @@ export async function cloudSend(provider, api, mime) {
   return { status: 'accepted', providerId: response.id };
 }
 
-export async function graphSync(api, rawApi, previous, limit) {
+export async function graphSync(api, rawApi, previous, limit, options = {}) {
   const cursor = structuredClone(previous || {});
   if (cursor.schemaVersion !== 2) { cursor.folders = {}; cursor.schemaVersion = 2; }
   cursor.folders ||= {};
   const messages = new Map();
-  const perFolder = Math.max(1, Math.floor(limit / FOLDERS.length));
-  for (const [remote, folder] of FOLDERS) {
+  const allowedFolders = options.folders ? FOLDERS.filter(([remote]) => options.folders.includes(remote)) : FOLDERS;
+  const perFolder = Math.max(1, Math.floor(limit / Math.max(1, allowedFolders.length)));
+  for (const [remote, folder] of allowedFolders) {
     const initial = `${GRAPH}/me/mailFolders/${remote}/messages/delta?$select=id,isRead,flag,receivedDateTime&$top=${perFolder}`;
     let url = cursor.folders[remote] || initial;
     let page;

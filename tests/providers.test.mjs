@@ -42,7 +42,7 @@ function oauthFetch(next = () => { throw new Error('Unexpected endpoint'); }) {
 test('migrations are idempotent; provider no-config status does not break account listing', async () => {
   const { db, service } = fixture(undefined, { DATA_KEY: '', GOOGLE_CLIENT_ID: '', MICROSOFT_CLIENT_ID: '' });
   service.migrate();
-  assert.equal(db.prepare('SELECT count(*) AS n FROM provider_migrations').get().n, 2);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM provider_migrations').get().n, 3);
   const response = await service.handle(new Request(`${env.PUBLIC_URL}/api/accounts`), user);
   assert.deepEqual((await response.json()).accounts, []);
   assert.ok(service.providerStatus().every(p => !p.configured && p.reason));

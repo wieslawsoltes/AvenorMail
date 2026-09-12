@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { fail, publicOrigin, randomToken } from './security.js';
 
-const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send';
-const MICROSOFT_SCOPE = 'offline_access https://graph.microsoft.com/User.Read https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send';
+const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.calendarlist.readonly https://www.googleapis.com/auth/contacts';
+const MICROSOFT_SCOPE = 'offline_access https://graph.microsoft.com/User.Read https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Mail.ReadWrite.Shared https://graph.microsoft.com/Mail.Send.Shared https://graph.microsoft.com/Calendars.ReadWrite https://graph.microsoft.com/Calendars.ReadWrite.Shared https://graph.microsoft.com/Contacts.ReadWrite';
 
 export function oauthConfig(provider, env) {
   const redirectUri = `${publicOrigin(env)}/api/oauth/${provider}/callback`;
@@ -17,7 +17,7 @@ export function oauthConfig(provider, env) {
     if (!/^[a-zA-Z0-9.-]+$/.test(tenant)) fail('MICROSOFT_TENANT is invalid.', 503, 'provider_not_configured');
     const base = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0`;
     return { clientId: env.MICROSOFT_CLIENT_ID, clientSecret: env.MICROSOFT_CLIENT_SECRET, redirectUri,
-      authorizationUrl: `${base}/authorize`, tokenUrl: `${base}/token`, scope: MICROSOFT_SCOPE };
+      authorizationUrl: `${base}/authorize`, tokenUrl: `${base}/token`, scope: MICROSOFT_SCOPE+(env.MICROSOFT_DIRECTORY_DISCOVERY==='true'?' https://graph.microsoft.com/User.ReadBasic.All':'') };
   }
   fail('Unknown mail provider.', 404);
 }
@@ -74,7 +74,7 @@ export async function tokenRequest(provider, env, fetchImpl, values) {
   const result = await fetchJSON(fetchImpl, config.tokenUrl, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
   if (!result?.access_token || typeof result.access_token !== 'string') fail('The mail provider did not issue an access token.', 502);
   return { accessToken: result.access_token, refreshToken: result.refresh_token || null,
-    expiresAt: Date.now() + Math.max(1, Number(result.expires_in) || 3600) * 1000, scope: result.scope || config.scope };
+    expiresAt: Date.now() + Math.max(1, Number(result.expires_in) || 3600) * 1000, scope: result.scope || config.scope, scopeProvided: Boolean(result.scope) };
 }
 
 export async function providerIdentity(provider, token, fetchImpl) {
