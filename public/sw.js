@@ -2,7 +2,7 @@
 const BASE = new URL('./', self.location.href);
 const PREFIX = 'avenor-shell-' + encodeURIComponent(BASE.pathname) + '-';
 const VERSION = PREFIX + 'v4';
-const REQUIRED = ['index.html', 'app.js', 'core.js', 'runtime.js', 'collab.js', 'collab-store.js', 'renderer.js', 'offline.js', 'gpu-workspace.js', 'gpu-mode.js', 'scene-text.js', 'scene-layout.js', 'search-worker.js', 'seed.js', 'style.css'];
+const REQUIRED = ['index.html', 'app.js', 'core.js', 'calendar-recurrence.js', 'windows-timezones.js', 'provider-ui.js', 'compliance-ui.js', 'inbound-ui.js', 'runtime.js', 'collab.js', 'collab-store.js', 'renderer.js', 'offline.js', 'gpu-workspace.js', 'gpu-mode.js', 'scene-text.js', 'scene-layout.js', 'search-worker.js', 'seed.js', 'style.css'];
 const OPTIONAL = ['favicon.svg', 'manifest.webmanifest'];
 const shellURLs = new Set([...REQUIRED, ...OPTIONAL].map(path => new URL(path, BASE).href));
 self.addEventListener('install', event => {

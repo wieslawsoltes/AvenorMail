@@ -1,3 +1,5 @@
+import { expandImportedCalendar, providerCalendar } from './calendar-recurrence.js';
+export { calendarOccurrences } from './calendar-recurrence.js';
 export const escapeHtml=(v='')=>String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export const textOnly=(v='')=>String(v).replace(/<[^>]*>/g,' ').replace(/&nbsp;/g,' ').replace(/\s+/g,' ').trim();
 export function matches(message,query){const tokens=String(query).match(/(?:[^\s"]+|"[^"]*")+/g)||[];return tokens.every(raw=>{let [k,...rest]=raw.split(':');let value=rest.join(':').replace(/^"|"$/g,'').toLowerCase();if(!rest.length)return `${message.from} ${message.to} ${message.subject} ${textOnly(message.body)}`.toLowerCase().includes(k.toLowerCase());if(k==='from'||k==='to'||k==='subject'||k==='category')return String(message[k]||'').toLowerCase().includes(value);if(k==='is')return value==='unread'?!message.read:value==='flagged'?!!message.flagged:value==='read'?!!message.read:false;if(k==='has')return value==='attachment'&&!!message.attachments?.length;if(k==='before')return new Date(message.date)<new Date(value);if(k==='after')return new Date(message.date)>new Date(value);return false;});}
@@ -5,6 +7,8 @@ const zoneFormatters=new Map();
 function wallTime(date,zone){if(zone==='UTC')return new Date(date);let formatter=zoneFormatters.get(zone);if(!formatter){formatter=new Intl.DateTimeFormat('en-US',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});zoneFormatters.set(zone,formatter);}const parts=Object.fromEntries(formatter.formatToParts(date).map(p=>[p.type,p.value]));return new Date(Date.UTC(+parts.year,+parts.month-1,+parts.day,+parts.hour,+parts.minute,+parts.second));}
 function fromWall(wall,zone){if(zone==='UTC')return new Date(wall);let instant=+wall;for(let i=0;i<4;i++){const diff=+wall-+wallTime(new Date(instant),zone);if(!diff)break;instant+=diff;}return new Date(instant);}
 export function occurrences(event,start,end){
+ if(event.cancelled)return [];
+ if(event.calendarComponent||event.provider)return expandImportedCalendar(providerCalendar(event),start,end);
  const out=[],base=new Date(event.start),finish=new Date(event.end),lower=new Date(start),upper=new Date(end),duration=+finish-+base,zone=event.timezone||'UTC';
  if(!Number.isFinite(+base)||!Number.isFinite(+finish)||!(upper>lower)||duration<=0)return out;
  const repeat=event.repeat||'none',until=event.until?new Date(event.until+'T23:59:59.999Z'):new Date(8640000000000000),baseWall=wallTime(base,zone),lowerWall=wallTime(lower,zone);
