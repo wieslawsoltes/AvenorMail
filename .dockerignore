@@ -1,0 +1,11 @@
+.git
+node_modules
+.env*
+!.env.example
+data
+pages
+dist
+.next
+.wrangler
+.sites-runtime
+outputs

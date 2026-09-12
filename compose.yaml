@@ -1,0 +1,14 @@
+services:
+  avenor:
+    build: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - avenor-data:/data
+volumes:
+  avenor-data:
