@@ -1,4 +1,5 @@
 import * as Y from 'yjs';
+import { CollaborationStore } from './collab-store.js';
 import { Awareness } from 'y-protocols/awareness';
 import { ySyncPlugin, ySyncPluginKey, yCursorPlugin, yUndoPlugin, undo, redo, prosemirrorToYDoc } from 'y-prosemirror';
 import { Schema, DOMParser as PMParser, DOMSerializer } from 'prosemirror-model';
@@ -28,9 +29,12 @@ const peerNumber = value => [...value].reduce((hash, char) => ((hash * 31) + cha
 
 /** One authenticated socket carries scoped record changes, presence and rich text. */
 export class LiveClient {
-  constructor({ url, getToken, onChange = () => {}, onPresence = () => {}, onStatus = () => {} }) {
+  constructor({ url, getToken, store = new CollaborationStore(), onChange = () => {}, onPresence = () => {}, onStatus = () => {} }) {
     this.url = url || `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/live`;
     this.getToken = getToken;
+    this.store = store;
+    this.receiving = Promise.resolve();
+    this.closingEditors = new Set();
     this.onChange = onChange;
     this.onPresence = onPresence;
     this.onStatus = onStatus;
@@ -41,6 +45,11 @@ export class LiveClient {
     this.stopped = false;
     this.authenticated = false;
     this.attempt = 0;
+    this.beforeUnload = event => {
+      if (![...this.editors.values()].some(editor => editor.persistCount > 0 || editor.storageError)) return;
+      event.preventDefault(); event.returnValue = '';
+    };
+    globalThis.addEventListener?.('beforeunload', this.beforeUnload);
   }
 
   connect() {
@@ -62,7 +71,7 @@ export class LiveClient {
     });
     socket.addEventListener('message', event => {
       if (socket !== this.socket) return;
-      try { this.receive(JSON.parse(event.data)); } catch (error) { this.onStatus('error', { message: error.message }); }
+      this.receiving = this.receiving.then(() => { if (socket === this.socket) return this.receive(JSON.parse(event.data)); }).catch(error => this.onStatus('error', { message: error.message }));
     });
     socket.addEventListener('close', event => {
       if (socket !== this.socket) return;
@@ -72,7 +81,10 @@ export class LiveClient {
       for (const editor of this.editors.values()) editor.connected = false;
       for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(new Error('Connection lost before the server confirmed this edit.')); }
       this.pending.clear();
-      this.onStatus(event.code === 4401 ? 'expired' : 'offline');
+      if (event.code === 4401) {
+        for (const editor of this.editors.values()) { editor.readOnly = true; editor.view?.setProps({ editable: () => false }); }
+      }
+      if (!this.stopped) this.onStatus(event.code === 4401 ? 'expired' : 'offline');
       if (!this.stopped && event.code !== 4401) this.retryTimer = setTimeout(() => { if (!this.stopped) this.connect(); }, Math.min(15000, 500 * 2 ** this.attempt++) + Math.random() * 250);
     });
     socket.addEventListener('error', () => {});
@@ -95,11 +107,16 @@ export class LiveClient {
     };
   }
 
-  receive(message) {
+  async receive(message) {
+    if (this.stopped && message.type !== 'ack') return;
     if (message.type === 'ready') {
       clearTimeout(this.retryTimer);
       this.authenticated = true;
       this.attempt = 0;
+      if (this.user && this.user.userId !== message.user.userId) {
+        for (const editor of [...this.editors.values()]) editor.cleanup();
+        this.scopes.clear();
+      }
       this.user = message.user;
       this.clientId = message.clientId;
       this.connectResolve?.(this);
@@ -111,30 +128,59 @@ export class LiveClient {
     if (message.type === 'change') { this.onChange(message.event, message.scope); return; }
     const editor = this.editors.get(message.recordId);
     if (message.type === 'joined' && editor) {
-      editor.readOnly = message.readOnly;
-      editor.connected = true;
-      Y.applyUpdate(editor.doc, decode(message.state), REMOTE);
-      if (editor.unsynced && message.initialized) { editor.view?.destroy(); editor.view = null; }
-      if (!editor.view) editor.mount(message.initialized);
-      editor.view?.setProps({ editable: () => !editor.readOnly && !editor.locked });
-      editor.awareness.setLocalStateField('user', { name: this.user.displayName, color: colorFor(this.user.userId) });
-      editor.readyResolve(editor.cleanup);
-      // Reconnect merges offline edits and sends only structures the server lacks.
-      const difference = Y.encodeStateAsUpdate(editor.doc, decode(message.vector));
-      if (!editor.readOnly && difference.length > 2) this.push(editor, difference);
-      else if (difference.length <= 2) editor.lastError = null;
-      this.onStatus('document-ready', { recordId: editor.recordId, readOnly: editor.readOnly });
+      try {
+        await editor.persistence;
+        if (editor.destroyed) return;
+        const snapshot = await this.store.checkpoint(editor.storageKey, decode(message.state), { revision: message.revision, vector: decode(message.vector), authorized: true });
+        if (editor.destroyed) return;
+        editor.readOnly = message.readOnly;
+        editor.revoked = false;
+        editor.connected = true;
+        editor.pendingCount = snapshot.pending.length;
+        // The server must authorize this record before any cached bytes enter
+        // the view. Merge CRDT structures, never replace its authoritative HTML.
+        Y.applyUpdate(editor.doc, snapshot.state, REMOTE);
+        if (editor.unsynced && message.initialized) { editor.view?.destroy(); editor.view = null; }
+        if (!editor.view) editor.mount(message.initialized);
+        editor.view?.setProps({ editable: () => !editor.readOnly && !editor.locked });
+        editor.awareness.setLocalStateField('user', { name: this.user.displayName, color: colorFor(this.user.userId) });
+        // A diff contains tombstones as well as structures; replaying it is
+        // idempotent even if a previous server ACK was lost in transit.
+        const difference = Y.encodeStateAsUpdate(editor.doc, decode(message.vector));
+        if (!editor.readOnly && (difference.length > 2 || snapshot.pending.length)) this.push(editor, difference, snapshot.pending.map(entry => entry.id));
+        else if (!snapshot.pending.length) editor.lastError = null;
+        editor.readyResolve(editor.cleanup);
+        this.onStatus('document-ready', { recordId: editor.recordId, readOnly: editor.readOnly, pending: snapshot.pending.length });
+      } catch (error) { this.storageFailure(editor, error); }
       return;
     }
     if (message.type === 'update' && editor) {
-      Y.applyUpdate(editor.doc, decode(message.update), REMOTE);
-      if (editor.unsynced) { editor.view?.destroy(); editor.mount(true); }
+      try {
+        const snapshot = await this.store.checkpoint(editor.storageKey, decode(message.update), { revision: message.revision });
+        if (editor.destroyed || snapshot.revoked) return;
+        editor.pendingCount = snapshot.pending.length;
+        Y.applyUpdate(editor.doc, snapshot.state, REMOTE);
+        if (editor.unsynced) { editor.view?.destroy(); editor.mount(true); }
+      } catch (error) { this.storageFailure(editor, error); }
       return;
     }
     if (message.type === 'ack') {
       const pending = this.pending.get(message.requestId);
-      if (pending) { clearTimeout(pending.timer); this.pending.delete(message.requestId); pending.resolve(message); }
-      this.onStatus('saved', { recordId: message.recordId, revision: message.revision });
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      try {
+        const snapshot = await pending.commit(message);
+        this.pending.delete(message.requestId);
+        pending.editor.pendingCount = snapshot.pending.length;
+        if (snapshot.revoked) { pending.reject(new Error('Document access was revoked.')); return; }
+        pending.resolve(message);
+        const remaining = snapshot.pending.length + pending.editor.persistCount;
+        if (!this.stopped) this.onStatus(remaining ? 'saving' : 'saved', { recordId: message.recordId, revision: message.revision, pending: remaining });
+      } catch (error) {
+        this.pending.delete(message.requestId);
+        pending.reject(error);
+        this.storageFailure(pending.editor, error);
+      }
       return;
     }
     if (message.type === 'permission' && editor) {
@@ -157,7 +203,12 @@ export class LiveClient {
         binding.readOnly = true;
         binding.connected = false;
         binding.view?.setProps({ editable: () => false });
-        binding.readyReject(new Error('Document access was revoked.'));
+        binding.lastError = new Error('Document access was revoked.');
+        binding.readyReject(binding.lastError);
+        binding.revoked = true;
+        binding.view?.destroy(); binding.view = null;
+        binding.element.replaceChildren();
+        if (binding.storageKey) await this.store.revoke(binding.storageKey);
       }
       this.onStatus('revoked', message);
       return;
@@ -170,25 +221,68 @@ export class LiveClient {
         editor.lastError = error;
         editor.readyReject(error);
         if (['READ_ONLY', 'FORBIDDEN', 'SCOPE_MISMATCH'].includes(message.code)) { editor.readOnly = true; editor.view?.setProps({ editable: () => false }); }
+        if (['FORBIDDEN', 'SCOPE_MISMATCH'].includes(message.code) && editor.storageKey) { editor.revoked = true; editor.view?.destroy(); editor.view = null; editor.element.replaceChildren(); await this.store.revoke(editor.storageKey); }
       }
       this.onStatus('error', message);
     }
   }
 
-  join(editor) {
-    this.send({ type: 'join', scope: editor.scope, recordId: editor.recordId, initialUpdate: editor.initialUpdate });
+  async join(editor) {
+    try {
+      if (editor.destroyed || !this.authenticated) return;
+      const socket = this.socket;
+      const key = CollaborationStore.key({ url: this.url, userId: this.user.userId, scope: editor.scope, recordId: editor.recordId });
+      if (editor.storageKey && editor.storageKey !== key) throw new Error('The authenticated document identity changed. Reopen the draft.');
+      editor.storageKey = key;
+      await this.store.load(key); // Verify storage is available before editing.
+      if (editor.destroyed || socket !== this.socket || !this.authenticated) return;
+      this.send({ type: 'join', scope: editor.scope, recordId: editor.recordId, initialUpdate: editor.initialUpdate });
+    } catch (error) { this.storageFailure(editor, error); }
   }
 
-  push(editor, update) {
-    if (!editor.connected || editor.readOnly || !this.authenticated) return;
+  storageFailure(editor, error) {
+    editor.lastError = error;
+    editor.storageError = error;
+    editor.readOnly = true;
+    editor.view?.setProps({ editable: () => false });
+    editor.readyReject(error);
+    this.onStatus('error', { recordId: editor.recordId, code: 'LOCAL_STORAGE', message: error.message });
+  }
+
+  persistUpdate(editor, bytes) {
+    // Append synchronously to the promise chain before any UI can call flush.
+    // Never put a network ACK in this chain: offline writes must keep committing.
+    editor.persistCount++;
+    const update = new Uint8Array(bytes);
+    const operation = editor.persistence.then(async () => {
+      const { record, id } = await this.store.append(editor.storageKey, update);
+      if (editor.destroyed) return;
+      editor.pendingCount = record.pending.length;
+      // Atomic journal merge includes writes from another tab sharing this key.
+      Y.applyUpdate(editor.doc, record.state, REMOTE);
+      if (editor.connected && !editor.readOnly && this.authenticated) this.push(editor, update, [id]);
+      else this.onStatus('offline-saved', { recordId: editor.recordId, pending: record.pending.length });
+    });
+    editor.persistence = operation.then(() => { editor.persistCount--; }, error => { editor.persistCount--; this.storageFailure(editor, error); });
+    return operation;
+  }
+
+  push(editor, update, journalIds = []) {
+    if (editor.destroyed || !editor.connected || editor.readOnly || !this.authenticated) return;
     const requestId = `${this.clientId}:${++this.sequence}`;
     const promise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.pending.delete(requestId); reject(new Error('The server has not confirmed this edit. Reconnect before sending.')); }, 15000);
-      this.pending.set(requestId, { resolve, reject, timer, recordId: editor.recordId });
+      this.pending.set(requestId, { resolve, reject, timer, recordId: editor.recordId, editor,
+        commit: message => this.store.acknowledge(editor.storageKey, journalIds, update, message.revision),
+      });
     });
     editor.writes.add(promise);
     promise.then(() => { editor.writes.delete(promise); editor.lastError = null; }, error => { editor.writes.delete(promise); editor.lastError = error; });
-    this.send({ type: 'update', recordId: editor.recordId, scope: editor.scope, update: encode(update), requestId });
+    if (!this.send({ type: 'update', recordId: editor.recordId, scope: editor.scope, update: encode(update), requestId })) {
+      const pending = this.pending.get(requestId);
+      clearTimeout(pending.timer); this.pending.delete(requestId);
+      pending.reject(new Error('Reconnect before saving or sending this shared draft.'));
+    }
     this.onStatus('saving', { recordId: editor.recordId });
     return promise;
   }
@@ -219,13 +313,14 @@ export class LiveClient {
     seed.destroy();
     const doc = new Y.Doc();
     const awareness = new Awareness(doc);
-    const editor = { doc, awareness, recordId, scope, initialUpdate, element, view: null, connected: false, readOnly: true, locked: false, writes: new Set(), lastError: null };
+    const editor = { doc, awareness, recordId, scope, initialUpdate, element, view: null, connected: false, readOnly: true, locked: false, writes: new Set(), lastError: null, persistence: Promise.resolve(), persistCount: 0, pendingCount: 0, destroyed: false };
     const originalEditable = element.getAttribute('contenteditable');
     element.contentEditable = 'false';
     element.dataset.collaborative = 'true';
     const ready = new Promise((resolve, reject) => { editor.readyResolve = resolve; editor.readyReject = reject; });
     ready.catch(() => {});
     const serialize = () => {
+      if (editor.revoked) return '';
       if (!editor.view) return element.innerHTML;
       const container = document.createElement('div');
       container.appendChild(DOMSerializer.fromSchema(collaborationSchema).serializeFragment(editor.view.state.doc.content));
@@ -252,13 +347,13 @@ export class LiveClient {
           editor.view = this;
           const next = this.state.apply(transaction);
           this.updateState(next);
-          if (transaction.docChanged) onChange(serialize(), { recordId, scope, remote: Boolean(transaction.getMeta(ySyncPluginKey)?.isChangeOrigin), pending: editor.writes.size > 0 });
+          if (transaction.docChanged) onChange(serialize(), { recordId, scope, remote: Boolean(transaction.getMeta(ySyncPluginKey)?.isChangeOrigin), pending: editor.writes.size > 0 || editor.persistCount > 0 });
         },
       });
       onChange(serialize(), { recordId, scope, remote: true, pending: false });
     };
     const update = (bytes, origin) => {
-      if (origin !== REMOTE) this.push(editor, bytes);
+      if (origin !== REMOTE) this.persistUpdate(editor, bytes).catch(() => {});
     };
     doc.on('update', update);
     const presence = (_changes, origin) => {
@@ -268,12 +363,14 @@ export class LiveClient {
     awareness.on('update', presence);
     let destroyed = false;
     const cleanup = () => {
-      if (destroyed) return;
+      if (destroyed) return cleanup.closed;
       destroyed = true;
+      editor.destroyed = true;
+      editor.readyReject(new Error('The shared editor was closed.'));
       const html = serialize();
       editor.connected = false;
       this.send({ type: 'leave', scope, recordId });
-      this.editors.delete(recordId);
+      if (this.editors.get(recordId) === editor) this.editors.delete(recordId);
       editor.view?.destroy();
       editor.view = null;
       awareness.off('update', presence);
@@ -284,16 +381,42 @@ export class LiveClient {
       if (originalEditable === null) element.removeAttribute('contenteditable'); else element.setAttribute('contenteditable', originalEditable);
       delete element.dataset.collaborative;
       delete element.collaboration;
+      cleanup.closed = editor.persistence.then(() => {
+        if (editor.storageError) throw editor.storageError;
+      });
+      this.closingEditors.add(cleanup.closed);
+      cleanup.closed.then(() => this.closingEditors.delete(cleanup.closed), () => this.closingEditors.delete(cleanup.closed));
+      return cleanup.closed;
     };
     cleanup.ready = ready;
+    cleanup.closed = Promise.resolve();
+    cleanup.persist = async () => {
+      await editor.persistence;
+      if (editor.storageError) throw editor.storageError;
+      return serialize();
+    };
     cleanup.getHTML = serialize;
     cleanup.isReadOnly = () => editor.readOnly;
+    cleanup.hasPending = () => editor.persistCount > 0 || editor.pendingCount > 0 || editor.writes.size > 0;
     cleanup.setLocked = value => { if (destroyed) return; editor.locked = Boolean(value); if (editor.view && !editor.view.isDestroyed) editor.view.setProps({ editable: () => !editor.readOnly && !editor.locked }); };
     cleanup.flush = async () => {
+      if (destroyed) throw new Error('The shared editor was closed.');
       await ready;
+      await cleanup.persist();
       if (!this.authenticated || !editor.connected) throw new Error('Reconnect before saving or sending this shared draft.');
       if (editor.readOnly) throw new Error('This draft is read only or has already been sent.');
-      while (editor.writes.size) await Promise.all([...editor.writes]);
+      while (editor.writes.size || editor.persistCount) {
+        await editor.persistence;
+        await Promise.all([...editor.writes]);
+      }
+      // A same-identity tab can have journaled an edit while this view was idle.
+      const snapshot = await this.store.load(editor.storageKey);
+      if (snapshot?.revoked) throw new Error('Document access was revoked.');
+      if (snapshot?.pending.length) {
+        Y.applyUpdate(editor.doc, snapshot.state, REMOTE);
+        const difference = Y.encodeStateAsUpdate(editor.doc, snapshot.serverVector);
+        await this.push(editor, difference, snapshot.pending.map(entry => entry.id));
+      }
       if (editor.lastError) throw editor.lastError;
       return serialize();
     };
@@ -322,10 +445,15 @@ export class LiveClient {
   close() {
     this.stopped = true;
     clearTimeout(this.retryTimer);
+    globalThis.removeEventListener?.('beforeunload', this.beforeUnload);
     for (const editor of [...this.editors.values()]) editor.cleanup();
     this.socket?.close(1000, 'Signed out');
     this.scopes.clear();
     this.authenticated = false;
+    return Promise.allSettled([...this.closingEditors]).then(results => {
+      const failed = results.find(result => result.status === 'rejected');
+      if (failed) throw failed.reason;
+    });
   }
 }
 

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
+import { IDBFactory } from 'fake-indexeddb';
 import { createServer } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { WebSocket } from 'ws';
@@ -11,13 +12,14 @@ import { RealtimeHub, collaborationDocumentHTML } from '../backend/realtime.js';
 test('rich editor renders once, merges concurrent edits and formatting, reconnects and obeys revocation', async () => {
   const dom = new JSDOM('<html><head></head><body><div id="a" contenteditable="true"><p>Hello world</p></div><div id="b" contenteditable="true"><p>Hello world</p></div></body></html>', { url: 'http://localhost:3000', pretendToBeVisual: true });
   const previous = new Map();
-  for (const key of ['window', 'document', 'MutationObserver', 'HTMLElement', 'Node', 'DOMParser', 'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame', 'navigator', 'WebSocket']) previous.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+  for (const key of ['window', 'document', 'MutationObserver', 'HTMLElement', 'Node', 'DOMParser', 'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame', 'navigator', 'WebSocket', 'indexedDB']) previous.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
   for (const key of ['window', 'document', 'MutationObserver', 'HTMLElement', 'Node', 'DOMParser', 'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
     const value = key === 'window' ? dom.window : ['getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame'].includes(key) ? dom.window[key].bind(dom.window) : dom.window[key];
     Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
   }
   Object.defineProperty(globalThis, 'navigator', { configurable: true, value: dom.window.navigator });
   Object.defineProperty(globalThis, 'WebSocket', { configurable: true, value: class extends WebSocket { constructor(url) { super(url, { origin: 'http://localhost:3000' }); } } });
+  Object.defineProperty(globalThis, 'indexedDB', { configurable: true, value: new IDBFactory() });
   dom.window.Range.prototype.getClientRects = () => [];
   dom.window.Range.prototype.getBoundingClientRect = () => ({ left: 0, right: 0, top: 0, bottom: 0, width: 0, height: 0 });
   const db = new DatabaseSync(':memory:');
@@ -29,19 +31,21 @@ test('rich editor renders once, merges concurrent edits and formatting, reconnec
   const { LiveClient } = await import('../public/collab.js');
   const errors = [], statuses = [];
   const make = token => new LiveClient({ url: `ws://127.0.0.1:${server.address().port}/api/live`, getToken: () => token, onStatus: (status, details) => { statuses.push({ token, status, details }); if (status === 'error') errors.push(details); } });
-  const alice = make('alice'), bob = make('bob');
+  let alice = make('alice');
+  const bob = make('bob');
   const until = async predicate => {
     const deadline = Date.now() + 2500;
     while (!predicate()) { if (Date.now() > deadline) throw new Error('Client did not reach the expected state'); await new Promise(resolve => setTimeout(resolve, 5)); }
   };
   try {
     await Promise.all([alice.connect(), bob.connect()]);
-    const a = alice.attachEditor({ element: document.querySelector('#a'), recordId: 'draft', scope: 'team:a' });
+    let a = alice.attachEditor({ element: document.querySelector('#a'), recordId: 'draft', scope: 'team:a' });
     const b = bob.attachEditor({ element: document.querySelector('#b'), recordId: 'draft', scope: 'team:a' });
     await Promise.all([a.ready, b.ready]);
     assert.equal(a.getHTML(), '<p>Hello world</p>');
     assert.equal(b.getHTML(), a.getHTML());
-    const av = alice.editors.get('draft').view, bv = bob.editors.get('draft').view;
+    let av = alice.editors.get('draft').view;
+    const bv = bob.editors.get('draft').view;
 
     // Mutate both views before either has received the other's network update.
     av.dispatch(av.state.tr.insertText(' Alice', 6));
@@ -65,6 +69,32 @@ test('rich editor renders once, merges concurrent edits and formatting, reconnec
     assert.equal(av.state.selection.anchor, 12);
     assert.equal(av.state.selection.head, 17);
 
+    // Neither a wire submission nor a saved status may outrun local durable IO.
+    const append = alice.store.append.bind(alice.store);
+    let releaseAppend;
+    const appendGate = new Promise(resolve => { releaseAppend = resolve; });
+    alice.store.append = async (...args) => { await appendGate; return append(...args); };
+    av.dispatch(av.state.tr.insertText(' durable-gated', av.state.doc.content.size - 1));
+    await new Promise(resolve => setTimeout(resolve, 15));
+    assert.doesNotMatch(collaborationDocumentHTML(db, 'draft'), /durable-gated/);
+    releaseAppend(); await a.flush();
+    alice.store.append = append;
+    assert.match(collaborationDocumentHTML(db, 'draft'), /durable-gated/);
+
+    const acknowledge = alice.store.acknowledge.bind(alice.store);
+    let releaseAck, ackStarted = false;
+    const ackGate = new Promise(resolve => { releaseAck = resolve; });
+    alice.store.acknowledge = async (...args) => { ackStarted = true; await ackGate; return acknowledge(...args); };
+    const previousSaved = statuses.filter(value => value.token === 'alice' && value.status === 'saved').length;
+    av.dispatch(av.state.tr.insertText(' checkpoint-gated', av.state.doc.content.size - 1));
+    let flushed = false;
+    const flushing = a.flush().then(() => { flushed = true; });
+    await until(() => ackStarted);
+    assert.equal(flushed, false);
+    assert.equal(statuses.filter(value => value.token === 'alice' && value.status === 'saved').length, previousSaved);
+    releaseAck(); await flushing;
+    alice.store.acknowledge = acknowledge;
+
     // Preserve local changes in the open editor while disconnected, then merge.
     alice.socket.terminate();
     await until(() => !alice.authenticated);
@@ -80,6 +110,37 @@ test('rich editor renders once, merges concurrent edits and formatting, reconnec
     assert.match(a.getHTML(), /online/);
     assert.equal(collaborationDocumentHTML(db, 'draft'), a.getHTML());
 
+    // Full editor/client teardown simulates a page reload. The only source of
+    // the disconnected change is the committed IndexedDB CRDT journal.
+    alice.socket.terminate();
+    await until(() => !alice.authenticated);
+    av.dispatch(av.state.tr.insertText(' reload-survivor', av.state.doc.content.size - 1));
+    av.dispatch(av.state.tr.setSelection(TextSelection.create(av.state.doc, 1, 5)));
+    assert.equal(a.format('italic'), true);
+    const storageKey = alice.editors.get('draft').storageKey;
+    // Detaching immediately must finish the queued IDB transaction even after
+    // the Y.Doc and editor view have already been destroyed.
+    await a();
+    await a.closed;
+    assert.ok((await alice.store.load(storageKey)).pending.length > 0);
+    await alice.close();
+    document.querySelector('#a').innerHTML = '<p>Stale HTML must not replace the server</p>';
+    bv.dispatch(bv.state.tr.insertText(' remote-during-reload', bv.state.doc.content.size - 1));
+    await b.flush();
+    alice = make('alice');
+    await alice.connect();
+    a = alice.attachEditor({ element: document.querySelector('#a'), recordId: 'draft', scope: 'team:a' });
+    await a.ready; await a.flush();
+    av = alice.editors.get('draft').view;
+    await until(() => a.getHTML() === b.getHTML());
+    assert.match(a.getHTML(), /reload-survivor/);
+    assert.match(a.getHTML(), /remote-during-reload/);
+    assert.match(a.getHTML(), /<em>/);
+    assert.doesNotMatch(a.getHTML(), /Stale HTML/);
+    assert.equal((a.getHTML().match(/reload-survivor/g) || []).length, 1);
+    assert.deepEqual((await alice.store.load(storageKey)).pending, []);
+    assert.equal(collaborationDocumentHTML(db, 'draft'), a.getHTML());
+
     // An acknowledged-on-server edit must be recognized after its wire ACK is lost.
     const send = hub.send.bind(hub);
     let dropped = false;
@@ -90,11 +151,19 @@ test('rich editor renders once, merges concurrent edits and formatting, reconnec
     av.dispatch(av.state.tr.insertText(' saved', av.state.doc.content.size - 1));
     await until(() => dropped && !alice.authenticated);
     hub.send = send;
+    await a.persist();
+    await alice.close();
+    document.querySelector('#a').innerHTML = '<p>Stale body</p>';
+    alice = make('alice');
     await alice.connect();
+    a = alice.attachEditor({ element: document.querySelector('#a'), recordId: 'draft', scope: 'team:a' });
+    await a.ready;
+    av = alice.editors.get('draft').view;
     await until(() => alice.editors.get('draft').connected);
     await a.flush();
     await until(() => a.getHTML() === b.getHTML());
     assert.match(a.getHTML(), /saved/);
+    assert.equal((a.getHTML().match(/ saved/g) || []).length, 1, 'ACK loss and reload cannot duplicate an accepted edit');
 
     // A viewer promoted before any writer opens a draft must initialize Yjs first.
     const extra = document.createElement('div'); extra.innerHTML = '<p>Reader seed</p>'; document.body.append(extra);
@@ -127,17 +196,27 @@ test('rich editor renders once, merges concurrent edits and formatting, reconnec
     assert.equal(bob.editors.get('reader-reconnect').unsynced, false);
     reconnectReader(); newWriter(); readers.delete('bob');
 
+    // Closing before its async journal/join handshake settles must cancel
+    // readiness, without leaving a dangling Promise or resurrecting its view.
+    const cancelledElement = document.createElement('div'); cancelledElement.innerHTML = '<p>Cancel</p>'; document.body.append(cancelledElement);
+    const cancelled = alice.attachEditor({ element: cancelledElement, recordId: 'cancel-before-ready', scope: 'team:a' });
+    const cancelledReady = assert.rejects(cancelled.ready, /closed/);
+    await cancelled();
+    await cancelledReady;
+    await assert.rejects(cancelled.flush(), /closed/);
+    assert.equal(alice.editors.has('cancel-before-ready'), false);
+
     // Record-specific revocation keeps the otherwise-readable workspace subscribed.
     bob.receive({ type: 'revoked', scope: 'team:a', recordId: 'unrelated-document' });
     assert.equal(bob.scopes.has('team:a'), true);
 
     revoked.add('bob');
     await hub.sweep();
-    await until(() => b.isReadOnly());
-    assert.equal(bv.dom.getAttribute('contenteditable'), 'false');
+    await until(() => b.isReadOnly() && b.getHTML() === '');
+    assert.equal(b.getHTML(), '', 'Revoked content is removed from the view and cleanup serializer');
     assert.equal(b.format('italic'), false);
     await assert.rejects(b.flush(), /Reconnect|read only/);
-    assert.deepEqual(errors, []);
+    assert.deepEqual(errors.filter(error => error.code !== 'FORBIDDEN'), [], 'No unexpected transport or storage errors');
     assert.ok(statuses.some(value => value.token === 'bob' && value.status === 'revoked'));
 
     const html = a.getHTML();
@@ -152,7 +231,7 @@ test('rich editor renders once, merges concurrent edits and formatting, reconnec
     assert.equal(document.querySelector('#a').innerHTML, html);
     assert.equal(document.querySelector('#a').getAttribute('contenteditable'), 'true');
   } finally {
-    alice.close(); bob.close();
+    await Promise.all([alice.close(), bob.close()]);
     await hub.close();
     await new Promise(resolve => server.close(resolve));
     db.close(); dom.window.close();
