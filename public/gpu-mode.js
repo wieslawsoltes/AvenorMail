@@ -1,4 +1,5 @@
 import {WorkspaceRenderer, colorChannels, intersectClip} from './gpu-workspace.js';
+import {textSegments, TextMeasurer} from './scene-text.js';
 
 const box = rectangle => ({x: rectangle.x ?? rectangle.left ?? 0, y: rectangle.y ?? rectangle.top ?? 0, width: rectangle.width, height: rectangle.height});
 const hasArea = rectangle => rectangle.width > 0 && rectangle.height > 0;
@@ -8,15 +9,41 @@ const visibleElement = element => {
   return hasArea(rectangle) && style.display !== 'none' && style.visibility !== 'hidden';
 };
 
+/** Group logical substrings by actual browser line boxes, then shape each complete line. */
+export function domTextLines(node, style) {
+  const document = node.ownerDocument, range = document.createRange(), source = node.textContent || '';
+  if (!source) return [];
+  const transform = value => style.textTransform === 'uppercase' ? value.toUpperCase() : style.textTransform === 'lowercase' ? value.toLowerCase() : value;
+  const collapse = value => /^(pre|pre-wrap|break-spaces)$/.test(style.whiteSpace) ? value : value.replace(/\s+/g, ' ');
+  range.selectNodeContents(node);
+  const whole = [...range.getClientRects()].filter(hasArea);
+  if (whole.length === 1) return [{text: transform(collapse(source)), bounds: box(whole[0])}];
+  const lines = []; let offset = 0;
+  for (const cluster of textSegments(source)) {
+    range.setStart(node, offset); offset += cluster.length; range.setEnd(node, offset);
+    const rectangles = [...range.getClientRects()].filter(hasArea);
+    if (!rectangles.length) continue;
+    const rectangle = box(rectangles[0]);
+    let line = lines.find(value => Math.abs(value.bounds.y - rectangle.y) < 1 && Math.abs(value.bounds.height - rectangle.height) < 1);
+    if (!line) { line = {text: '', bounds: rectangle}; lines.push(line); }
+    else {
+      const right = Math.max(line.bounds.x + line.bounds.width, rectangle.x + rectangle.width);
+      line.bounds.x = Math.min(line.bounds.x, rectangle.x); line.bounds.width = right - line.bounds.x;
+    }
+    line.text += cluster;
+  }
+  return lines.map(line => ({...line, text: transform(collapse(line.text))}));
+}
+
 /** Native editing, keyboard focus rings, selected text and embedded surfaces remain authoritative. */
-export function needsNativePresentation(root, active = root.ownerDocument.activeElement, keyboardFocus = false) {
+export function needsNativePresentation(root, active = root.ownerDocument.activeElement, keyboardFocus = false, {embedded = true} = {}) {
   if (active && root.contains(active)) {
     if (active.matches('input,select,textarea') || active.closest('[contenteditable="true"],[contenteditable=""],[contenteditable="plaintext-only"]')) return true;
     if (keyboardFocus && active.matches('button,a,[tabindex],[role="button"]')) return true;
   }
   const selection = root.ownerDocument.getSelection();
   if (selection && !selection.isCollapsed && (root.contains(selection.anchorNode) || root.contains(selection.focusNode))) return true;
-  return [...root.querySelectorAll('iframe,canvas,video,object,embed')].some(visibleElement);
+  return embedded && [...root.querySelectorAll('iframe,canvas,video,object,embed')].some(visibleElement);
 }
 
 /** Clip to each scroll/overflow ancestor's client area, keeping the two axes independent. */
@@ -31,6 +58,18 @@ export function visibleClip(element, viewport, getStyle = node => node.ownerDocu
     clip = intersectClip(clip, {x: clipX ? client.x : clip.x, y: clipY ? client.y : clip.y, width: clipX ? client.width : clip.width, height: clipY ? client.height : clip.height});
   }
   return clip;
+}
+
+export function visibleRoundedClips(element, getStyle = node => node.ownerDocument.defaultView.getComputedStyle(node)) {
+  const clips = [];
+  for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+    const style = getStyle(ancestor), radius = parseFloat(style.borderRadius) || 0;
+    if (radius && /^(auto|scroll|hidden|clip)$/.test(style.overflowX || style.overflow) && /^(auto|scroll|hidden|clip)$/.test(style.overflowY || style.overflow)) {
+      const rectangle = box(ancestor.getBoundingClientRect());
+      clips.push({x: rectangle.x + ancestor.clientLeft, y: rectangle.y + ancestor.clientTop, width: ancestor.clientWidth, height: ancestor.clientHeight, radius: Math.max(0, radius - Math.max(ancestor.clientLeft, ancestor.clientTop))});
+    }
+  }
+  return clips;
 }
 
 /** A standalone copy of the actual SVG, with computed paint styles resolved before rasterization. */
@@ -84,7 +123,7 @@ export class GpuPresentation {
       if (status.error) { this.showNative('Native rendering: ' + status.error); return; }
       if (this.ready) this.schedule();
     }});
-    this.icons = new Map(); this.ready = false; this.disposed = false; this.keyboardFocus = false; this.nativeReason = 'Initializing';
+    this.icons = new Map(); this.measurer = new TextMeasurer(); this.ready = false; this.disposed = false; this.keyboardFocus = false; this.nativeReason = 'Initializing';
     this.observer = new this.window.ResizeObserver(() => this.schedule()); this.observer.observe(root);
     this.mutation = new this.window.MutationObserver(records => { if (records.some(record => record.target !== root || record.attributeName !== 'class')) this.schedule(); });
     this.mutation.observe(root, {childList: true, subtree: true, characterData: true, attributes: true});
@@ -101,7 +140,8 @@ export class GpuPresentation {
     for (const event of ['pointerover', 'pointerout', 'input', 'change', 'load', 'transitionend', 'animationend']) listen(root, event, refresh);
     listen(this.window, 'beforeprint', () => this.showNative('Printing'));
     listen(this.window, 'afterprint', refresh);
-    this.document.fonts?.ready.then(() => this.schedule());
+    this.document.fonts?.ready.then(() => { this.measurer.clear(); this.schedule(); });
+    if (this.document.fonts) listen(this.document.fonts, 'loadingdone', () => { this.measurer.clear(); this.schedule(); });
   }
   async initialize() {
     await this.renderer.init();
@@ -116,7 +156,7 @@ export class GpuPresentation {
   }
   updateNativeVisibility() {
     if (this.disposed) return;
-    if (needsNativePresentation(this.root, this.document.activeElement, this.keyboardFocus)) this.showNative('Native interaction');
+    if (needsNativePresentation(this.root, this.document.activeElement, this.keyboardFocus, {embedded: false})) this.showNative('Native interaction');
     else this.schedule();
   }
   schedule() {
@@ -130,6 +170,7 @@ export class GpuPresentation {
     const existing = this.icons.get(key);
     if (existing) return existing;
     const entry = {image: null, pending: true, error: null}; this.icons.set(key, entry);
+    if (this.icons.size > 512) this.icons.delete(this.icons.keys().next().value);
     const image = new this.window.Image(), url = this.window.URL.createObjectURL(new Blob([markup], {type: 'image/svg+xml'}));
     image.onload = () => {
       try {
@@ -147,46 +188,48 @@ export class GpuPresentation {
   }
   draw() {
     if (this.disposed || !this.ready) return;
-    if (needsNativePresentation(this.root, this.document.activeElement, this.keyboardFocus)) { this.showNative('Native interaction'); return; }
+    if (needsNativePresentation(this.root, this.document.activeElement, this.keyboardFocus, {embedded: false})) { this.showNative('Native interaction'); return; }
     try {
+      const captureStarted = performance.now();
       const width = this.window.innerWidth, height = this.window.innerHeight, viewport = {x: 0, y: 0, width, height};
       const background = this.window.getComputedStyle(this.document.documentElement).getPropertyValue('--bg').trim() || '#f5f7fb';
       const items = [{type: 'rect', ...viewport, color: background, clip: viewport}], holes = [];
       let pending = false, unsupported = '';
       const color = (value, opacity) => { const rgba = colorChannels(value); rgba[3] *= opacity; return rgba; };
       const paintText = (node, style, opacity, clip) => {
-        if (!node.textContent.trim()) return;
-        const range = this.document.createRange(); let offset = 0;
-        for (const word of node.textContent.match(/\S+\s*/g) || []) {
-          const start = node.textContent.indexOf(word, offset); offset = start + word.length;
-          range.setStart(node, start); range.setEnd(node, offset);
-          if (range.getClientRects().length > 1) { unsupported = 'Complex text wrapping'; return; }
-          const rectangle = box(range.getBoundingClientRect());
-          if (!hasArea(intersectClip(rectangle, clip))) continue;
-          const size = parseFloat(style.fontSize) || 14;
-          let text = word.replace(/\s+/g, ' ');
-          if (style.textTransform === 'uppercase') text = text.toUpperCase();
-          if (style.textTransform === 'lowercase') text = text.toLowerCase();
-          // Complex shaping/bidi stays in the native text engine.
-          if (style.direction === 'rtl' || /[\u0590-\u0fff\u1100-\u11ff]/u.test(text)) { unsupported = 'Native text shaping'; return; }
-          items.push({type: 'text', text, ...rectangle, height: Math.max(rectangle.height, size * 1.3), fontSize: size, fontFamily: style.fontFamily, fontWeight: style.fontWeight, fontStyle: style.fontStyle, color: color(style.color, opacity), clip});
+        const clipShapes = visibleRoundedClips({parentElement: node.parentElement});
+        clip = intersectClip(clip, visibleClip({parentElement: node.parentElement}, viewport));
+        for (const line of domTextLines(node, style)) {
+          const rectangle = line.bounds;
+          if (!hasArea(intersectClip(rectangle, clip)) || !line.text.trim()) continue;
+          const textStyle = {fontSize: parseFloat(style.fontSize) || 14, fontFamily: style.fontFamily, fontWeight: style.fontWeight, fontStyle: style.fontStyle, direction: style.direction, letterSpacing: style.letterSpacing, wordSpacing: style.wordSpacing, fontKerning: style.fontKerning, fontStretch: style.fontStretch, fontVariantCaps: style.fontVariantCaps, lang: node.parentElement?.closest('[lang]')?.lang || this.document.documentElement.lang};
+          const metrics = this.measurer.measure(line.text, textStyle);
+          items.push({type: 'text', text: line.text, ...rectangle, ...textStyle, baseline: (rectangle.height - metrics.ascent - metrics.descent) / 2 + metrics.ascent, color: color(style.color, opacity), clip, clipShapes});
+          const decoration = style.textDecorationLine || '';
+          if (decoration.includes('underline') || decoration.includes('line-through')) {
+            const baseline = rectangle.y + (rectangle.height - metrics.ascent - metrics.descent) / 2 + metrics.ascent;
+            const thickness = parseFloat(style.textDecorationThickness) || Math.max(1, textStyle.fontSize / 14);
+            for (const line of decoration.split(' ')) if (line === 'underline' || line === 'line-through') items.push({type: 'rect', x: rectangle.x, y: line === 'underline' ? baseline + Math.max(1, metrics.descent / 2) : baseline - metrics.ascent * .35, width: rectangle.width, height: thickness, color: color(style.textDecorationColor || style.color, opacity), clip});
+          }
         }
       };
       const paintElement = (element, inheritedOpacity = 1) => {
         if (items.length > 16000 || unsupported) { unsupported ||= 'Scene size limit'; return; }
-        const style = this.window.getComputedStyle(element), rectangle = box(element.getBoundingClientRect()), clip = visibleClip(element, viewport);
+        const style = this.window.getComputedStyle(element), rectangle = box(element.getBoundingClientRect()), clip = visibleClip(element, viewport), clipShapes = visibleRoundedClips(element);
         if (style.display === 'none' || style.visibility === 'hidden') return;
         const opacity = inheritedOpacity * (parseFloat(style.opacity) || (style.opacity === '0' ? 0 : 1));
         if (!opacity) return;
         const visible = hasArea(intersectClip(rectangle, clip));
         if (visible) {
-          if (style.backgroundImage && style.backgroundImage !== 'none' || style.filter && style.filter !== 'none') { unsupported = 'Native CSS effect'; return; }
+          if (style.backgroundImage && style.backgroundImage !== 'none' || style.filter && style.filter !== 'none' || style.transform && style.transform !== 'none' || opacity < 1 && element.children.length) {
+            holes.push(intersectClip(rectangle, clip)); return;
+          }
           // A real form control is visible through a transparent hole in the read layer.
-          if (element.matches('input,select,textarea,[contenteditable="true"],[contenteditable=""],[contenteditable="plaintext-only"]')) {
+          if (element.matches('iframe,canvas,video,object,embed,input,select,textarea,[contenteditable="true"],[contenteditable=""],[contenteditable="plaintext-only"]')) {
             holes.push(intersectClip({x: rectangle.x - 1, y: rectangle.y - 1, width: rectangle.width + 2, height: rectangle.height + 2}, clip)); return;
           }
           const fill = color(style.backgroundColor || 'transparent', opacity);
-          if (fill[3]) items.push({type: 'rect', ...rectangle, color: fill, radius: parseFloat(style.borderRadius) || 0, clip});
+          if (fill[3]) items.push({type: 'rect', ...rectangle, color: fill, radius: parseFloat(style.borderRadius) || 0, clip, clipShapes});
           for (const side of ['Top', 'Right', 'Bottom', 'Left']) {
             const size = parseFloat(style['border' + side + 'Width']) || 0;
             if (!size || style['border' + side + 'Style'] === 'none') continue;
@@ -197,12 +240,12 @@ export class GpuPresentation {
             const cached = this.icon(element, rectangle);
             if (cached.error) unsupported = cached.error;
             else if (cached.pending) pending = true;
-            else items.push({type: 'image', image: cached.image, ...rectangle, opacity: inheritedOpacity, clip});
+            else items.push({type: 'image', image: cached.image, ...rectangle, opacity: inheritedOpacity, clip, clipShapes});
             return;
           }
           if (element.localName === 'img') {
             if (!element.complete || !element.naturalWidth) { unsupported = 'Image loading'; return; }
-            items.push({type: 'image', image: element, ...rectangle, opacity, clip}); return;
+            items.push({type: 'image', image: element, ...rectangle, opacity, clip, clipShapes}); return;
           }
           for (const pseudo of ['::before', '::after']) {
             const before = this.window.getComputedStyle(element, pseudo);
@@ -225,11 +268,13 @@ export class GpuPresentation {
       if (pending || unsupported) { this.showNative(unsupported || 'Preparing exact SVG icons'); return; }
       // Draw only outside native controls, leaving their actual browser pixels visible below.
       const display = [];
+      const captureFinished = performance.now();
       for (const item of items) {
         const bounds = intersectClip(item, item.clip || viewport);
         for (const clip of subtractRegions(bounds, holes)) display.push({...item, clip});
       }
-      this.renderer.render({width, height, background: '#00000000', items: display});
+      const metrics = this.renderer.render({width, height, background: '#00000000', items: display});
+      this.lastMetrics = {...metrics, nativeRegions: holes.length, captureMs: captureFinished - captureStarted, totalMs: performance.now() - captureStarted};
       this.renderer.activeCanvas.hidden = false;
       if (this.renderer.activeCanvas !== this.canvas) this.canvas.hidden = true;
       this.root.classList.add('gpu-source'); this.nativeReason = null;
@@ -238,6 +283,6 @@ export class GpuPresentation {
   dispose() {
     this.disposed = true; this.window.cancelAnimationFrame(this.frame); this.observer.disconnect(); this.mutation.disconnect();
     for (const remove of this.listeners) remove();
-    this.root.classList.remove('gpu-source'); this.renderer.dispose(); this.canvas.remove(); this.icons.clear();
+    this.root.classList.remove('gpu-source'); this.renderer.dispose(); this.canvas.remove(); this.icons.clear(); this.measurer.clear();
   }
 }

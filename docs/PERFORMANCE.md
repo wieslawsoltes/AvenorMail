@@ -48,18 +48,23 @@ await local.call('record', {
 
 `sw.js` resolves shell assets relative to its registration URL, so a Pages project base such as `/AvenorMail/` works. Navigation is network-first with an `index.html` offline fallback. Only an explicit allowlist of shell assets enters CacheStorage; API/auth URLs, attachments, arbitrary responses, and other origins never enter it. Shell cache names include the registration path. A required shell fetch failure rejects installation and preserves the last working service worker. Optional icons and install metadata may be absent. Register the worker from the same project base and use a matching relative manifest start URL.
 
-## Optional GPU workspace read layer
+## Standalone rendering engine
+
+`gpu-workspace.js`, `scene-text.js`, and `scene-layout.js` are ordinary ES modules. They have no application, database, framework, or server dependency. Use them directly with a canvas, or with the independent retained layout tree below.
 
 ```js
 import {WorkspaceRenderer} from './gpu-workspace.js';
-const renderer = await new WorkspaceRenderer(canvas, {onStatus}).init();
+const renderer = await new WorkspaceRenderer(canvas, {
+  maxDpr: 3, atlasSize: 2048, maxAtlasPages: 8, onStatus
+}).init();
 const metrics = renderer.render({
   width: 1000, height: 700, background: '#ffffff',
   items: [
     {id: 'row', type: 'rect', x: 20, y: 20, width: 400, height: 56,
      color: '#eee8f7', radius: 8},
     {type: 'text', x: 36, y: 35, width: 350, height: 22,
-     text: 'Design review', fontSize: 16, color: '#45375f'}
+     text: 'Design review · مرحبا 👩🏽‍💻', direction: 'rtl',
+     fontSize: 16, fontWeight: 500, color: '#45375f'}
   ]
 });
 const target = renderer.hitTest(25, 25);
@@ -67,34 +72,69 @@ await metrics.queueDone;
 renderer.dispose();
 ```
 
-The renderer retains the latest display list and draws rectangles, glyphs, and images using a WebGPU instance storage buffer. Image items accept `{type: 'image', image: CanvasImageSource, x, y, width, height, clip, opacity}`. Rasterize SVG icons to an ImageBitmap or canvas before adding them; their original colors are stored in the atlas, and Canvas 2D uses `drawImage` for fallback. Reuse image objects to reuse atlas entries. Hex, normalized RGBA arrays, and CSS `rgb()`/`rgba()` colors are supported. Text items accept `fontFamily`, `fontSize`, `fontWeight`, and `fontStyle`. Each glyph is rasterized with Canvas 2D into a real texture atlas, uploaded when the atlas changes, and sampled on GPU quads. Rounded rectangles use a fragment distance mask. Consecutive items sharing a clip form one instanced batch; scissor rectangles preserve clipping and painter order. The instance buffer grows geometrically rather than being recreated for each draw. A render currently normalizes and repacks the full list; it does not implement incremental dirty-region uploads.
+The backend draws rectangles, full shaped text lines, and images through instanced WebGPU storage buffers. Canvas 2D is a functional fallback for unavailable devices, failed initialization, validation errors, device loss, or a scene exceeding configured raster resources. Context replacement is managed because a canvas cannot switch from a WebGPU context to a 2D context. `dispose()` releases buffers, textures, font listeners, and replacement canvases.
 
-Geometry is in CSS pixels. Device pixel ratio is capped at 2 by default and can be overridden through the renderer option. GPU initialization, validation, or device loss switches to Canvas 2D. When the original canvas already acquired a WebGPU context, a replacement canvas is inserted because browsers prohibit changing its context type. `dispose()` releases GPU resources and the replacement canvas.
+Text is shaped by the browser's Canvas text preparation algorithm as a **complete line**, then cached as colored pixels in a paged texture atlas. Arabic joins, Hebrew/bidirectional runs, Indic shaping, ligatures, combining marks, emoji sequences, and color emoji are no longer split into separate character draw calls. Actual script/font support comes from the browser and installed/loaded fonts. `direction`, `fontFamily`, `fontSize`, `fontWeight`, `fontStyle`, `fontKerning`, `fontStretch`, `fontVariantCaps`, `letterSpacing`, `wordSpacing`, and `lang` participate in text preparation/cache identity. Letter and word spacing apply when the browser exposes those Canvas properties. `baseline` gives an explicit CSS-pixel baseline offset; `textAlign` supports left/right/center/start/end. Text occupies one instance per line in the usual case. Oversized lines are shaped once on a temporary surface and tiled **after rasterization**, preserving joins at tile boundaries. The temporary surface is bounded to 32 megapixels and a 32,768-pixel dimension.
 
-This is an optional visual read layer. Keep semantic DOM content, keyboard navigation, focus indicators, selections, text inputs, contenteditable composition, and native controls available. The GPU renderer is not an accessibility tree. Glyph-by-glyph atlas placement does not perform complex-script shaping, ligatures, or bidirectional layout; use DOM text for those cases. Rich HTML bodies, native emoji color rendering, and text selection are not implemented by this renderer. Images must be decoded and safe to upload to a canvas texture; large images that exceed atlas capacity trigger Canvas 2D fallback. The atlas has a finite 2048 × 2048 capacity and falls back to Canvas 2D on exhaustion.
+The atlas defaults to at most eight 2048 × 2048 RGBA pages: up to 128 MiB in GPU textures plus corresponding browser canvas storage. Pages are allocated on demand, reused between frames, and evicted by least recent frame use. Entries already referenced in the current frame cannot be evicted during packing. Font loading invalidates cached rasters. Page uploads cover only the dirty bounding region. The geometric instance and clip buffers grow geometrically; only changed aligned spans are uploaded. Scene normalization, packing, and changed-span detection still inspect the list on each render. These are reduced **uploads**, not a claim of sublinear full-frame CPU processing.
 
-## Experimental DOM presentation and calendar integration
+Geometry uses CSS pixels with DPR capped at 3 by default. Items support rectangular `clip` plus any number of nested rounded `clipShapes: [{x,y,width,height,radius}]`. The GPU evaluates rounded clip masks in the fragment stage and batches consecutive instances by page and scissor; Canvas uses matching nested clipping paths. Painter order is preserved across texture pages, and hit testing excludes rounded transparent corners and clipped areas. Offscreen items with known bounds are culled before raster preparation/drawing.
 
-`GpuPresentation` in `gpu-mode.js` measures the visible DOM, paints simple backgrounds, borders and text in local stacking order, and clips to scroll-container client bounds. SVG icons are serialized from their actual paths/viewBox with computed paint styles on every descendant, then rasterized and cached at device pixel ratio. Missing or failed icon rasterization shows the original DOM until a complete scene is available; it never substitutes placeholder glyphs. Text includes computed font weight and style.
+Image items accept `{type: 'image', image: CanvasImageSource, imageRevision, x, y, width, height, clip, clipShapes, opacity}`. Reuse the same decoded image object to reuse resources. Increment `imageRevision` for changes in a mutable canvas/video source. SVG icons should first be rasterized to a canvas or ImageBitmap; the application does this from actual SVG geometry. Decoding and cross-origin restrictions still apply. Images larger than a configured atlas page use the Canvas fallback. Hex, CSS `rgb()`/`rgba()`, and normalized RGBA arrays are supported color inputs.
 
-The DOM remains painted beneath the canvas. The read layer cuts transparent holes around actual inputs, selects, textareas and editable regions, retaining native browser control appearance and event handling. Editing, keyboard focus rings, text selection, embedded canvas/media and unsupported CSS/text layouts show the original DOM. Mouse focus on an ordinary button does not automatically disable presentation. The integration watches hover, input/change, scrolling, mutations, resize, and icon/font loading. Device-loss replacement canvases follow the same visibility lifecycle.
+## Independent layout, text flow, and semantic editing
 
-This integration is explicitly experimental. It does not replace browser layout or avoid the underlying DOM paint cost, and it currently measures/rebuilds the visible scene on updates. Simple local z-index sorting is not a complete implementation of CSS painting and stacking contexts; box shadows, sophisticated border shapes, kerning/letter spacing and all pseudo-element behavior are not pixel-equivalent. CSS background images/gradients, filters, complex wrapping, bidirectional/complex-script text, or a scene over 16,000 items return to native rendering. These fallbacks can mean a selected experimental mode is displaying the native page. Do not claim an application speedup from enabling this layer; measure actual workload and device results.
+```js
+import {RetainedScene, SemanticOverlay} from './scene-layout.js';
+import {TextMeasurer} from './scene-text.js';
+const state = new RetainedScene({
+  id: 'workspace', style: {layout: 'row', gap: 12, padding: 16},
+  children: [
+    {id: 'folders', style: {width: 180, height: 600, background: '#f0edf5'}},
+    {id: 'editor', role: 'textbox', editable: true, multiline: true,
+     label: 'Message', text: 'Hello',
+     style: {grow: 1, height: 300, padding: 12, fontSize: 16}}
+  ]
+}, {width: 1000, height: 700, measurer: new TextMeasurer()});
+const overlay = new SemanticOverlay(stage, {
+  onInput(id, value) { state.update(id, {text: value, value}); repaint(); }
+});
+function repaint() {
+  const scene = state.layout();
+  renderer.render(scene);
+  overlay.sync(scene);
+}
+repaint();
+```
 
-`CalendarRenderer` is a thin compatibility adapter over `WorkspaceRenderer`, retaining `initialize()`, `draw([{x,y,w,h,color}])`, `destroy()`, and the readable `mode`. It shares the geometric buffer allocation and actual device-loss Canvas 2D fallback. Calendar geometry is retained between resizes, with horizontal coordinates scaled to the new viewport; CSS continues to determine canvas size. Event labels and interactive controls remain HTML.
+The `stage` must establish a containing block, for example `position: relative`, around its canvas. `RetainedScene` clones the scene description while preserving callbacks and image resources, addresses nodes by unique stable IDs, caches layout until `update()` or `resize()`, and maps painter-order hit tests back to source nodes. `layoutScene(tree, options)` returns the display list, node bounds, content extent, and semantic records without measuring DOM elements. Measurement can be injected as a pure function for server/tests.
 
-## Reproducible measurement
+The explicit layout vocabulary provides column flow; horizontal flex rows with basis, grow, shrink, wrapping, gap, align/alignSelf, and justify; grid columns with pixel/percentage/fraction tracks; absolute stack placement; padding; min/max dimensions; explicit local z-order; and clipped scroll offsets. It is a **defined scene API**, not an implementation of arbitrary browser CSS (for example, CSS subgrid, arbitrary selectors, transforms, blend groups and writing-mode layout are outside this vocabulary). Text flow measures shaped candidate substrings, wraps at word boundaries, uses Unicode grapheme boundaries for oversized tokens, and supports max-line ellipsis without splitting combining sequences or emoji. `TextMeasurer` bounds its measurement cache and can be cleared after font changes.
 
-Open `benchmark.html` from the deployment or local server. Choose 1,000, 10,000, or 50,000 items, rectangles/text/mixed content, and WebGPU or Canvas 2D. The page warms up five frames and measures 60 requestAnimationFrame iterations. It reports actual CPU median/p95, observed frame intervals, and GPU queue completion wait where available. Stops produce partial results, explicitly labeled.
+`SemanticOverlay` keeps real browser focusable controls at scene bounds, labels/roles/states for assistive technology, keyboard activation, and native input/textarea editing. Synchronization retains focused elements and selection, never overwrites an active IME composition, and dispatches text changes after composition commits. This is plain-text native input; rich-text coauthoring remains the application's ProseMirror editor. Native focus rings and editing are intentional browser integration, not fake canvas caret/keyboard implementations. The engine does not implement a separate accessibility platform or OS input method.
 
-CPU time includes scene normalization, instance packing, cached glyph lookup, newly required glyph rasterization, texture/buffer uploads, and submission. **GPU queue time is the wall-clock interval from submission to `queue.onSubmittedWorkDone()`**, including queue scheduling. It is not a hardware timestamp and is not isolated GPU execution duration. Canvas 2D queue timing is reported unavailable. No benchmark numbers are embedded or claimed in advance. Text expands each retained item into multiple draw instances; the benchmark displays that count.
+## Workspace presentation and calendar integration
 
-The synthetic dense scene intentionally overdraws. Browser, operating system, GPU, browser power mode, window size, DPR, and background activity affect results. Compare the same scene in the same environment and separately profile the full app's interaction latency. GPU acceleration is not guaranteed to outperform DOM or Canvas 2D for small scenes.
+`GpuPresentation` still adapts Avenor's existing HTML views. It groups logical substrings by actual browser line boxes, shapes complete visual lines (including RTL, complex scripts, emoji and wrapped text), and carries computed font attributes and baseline metrics into the renderer. Backgrounds, borders, underline/strikethrough, real SVG icons, ordinary images, client-area scroll clips, and nested rounded overflow clips are captured. SVG paint styles are resolved on every descendant, so icons never become placeholder glyphs. Font, image, mutation, scrolling, resizing, hover, and input events invalidate the presentation.
 
-Run the persistence/queue and pure scene checks with:
+Actual form controls, editable regions, calendar canvases, media/embedded surfaces, transforms, gradients/background images, filters, and overlapping opacity groups remain visible in transparent native regions. Focusing native editors, keyboard focus rings, text selection, unsupported generated content, incomplete image preparation, or a scene beyond 16,000 captured items may show the whole native view. `lastMetrics` reports native region count, DOM capture time, and total capture/render time. The underlying DOM continues to supply layout, accessibility and event handling for these existing views; switching the workspace option does not migrate every view to the independent scene layout tree.
+
+This adapter is not a replacement browser CSS renderer. Local z-index ordering cannot reproduce every CSS stacking context; sophisticated borders, group blending, shadows and all pseudo-element behavior are not universally pixel-equivalent. DOM painting is retained beneath the canvas. Consequently, no application speedup or exact Outlook pixel equivalence is claimed. The independent renderer/scene API above is available for applications that deliberately own their layout and display list.
+
+`CalendarRenderer` retains its compatible `initialize()`, `draw([{x,y,w,h,color}])`, `destroy()`, and readable `mode` API over the same backend. Event labels and interactive calendar controls remain HTML. Resize maintains retained calendar geometry and CSS sizing.
+
+## Reproducible measurement and verification
+
+Open `benchmark.html` and choose 1,000, 10,000 or 50,000 items with rectangles, Latin text, Arabic/Hebrew/Indic/emoji runs, rounded images, mixed content, or independent grid layout. Select WebGPU when available or Canvas 2D. Five warm-up frames precede 60 measured requestAnimationFrame iterations. A retained item changes every frame; the layout case updates a scene node and recalculates layout. Grid content outside the viewport is culled, so its retained node count is different from its visible draw-instance count. The other synthetic scenes intentionally overlap densely.
+
+Results report median/p95 render CPU time, layout time, frame intervals, queue completion wait, and median buffer bytes uploaded. JSON export includes raw samples, timestamp, browser, actual backend, DPR, atlas pages and texture-upload bytes. No numbers are populated before running a measurement. The separate **Try standalone editing** action demonstrates independent scene layout with keyboard/IME semantic controls; it is not a timing result.
+
+**GPU queue wait is wall-clock time from submission to `queue.onSubmittedWorkDone()`**, including queue scheduling. It is not an isolated hardware execution timestamp. Canvas queue time is unavailable. These synthetic measurements do not establish full application interaction latency or a universal speed advantage. Compare identical browser/window/power settings and workload before drawing conclusions.
 
 ```sh
 node --test tests/offline*.mjs tests/rendering*.mjs
 ```
 
-The tests use `fake-indexeddb` for actual database transactions, reopens, attachment round trips, ordering, conflict retention, and local version checks. Pure rendering tests verify clipping, painter-order hit testing, color normalization, and immutable scene input. Service worker policy tests verify scoped navigation fallback, API exclusion, and rejection of incomplete shell installs. Shader compilation, real device loss, actual service worker lifecycle, and browser typography require browser validation; these Node tests do not prove GPU throughput or pixel equivalence.
+Rendering tests cover complete-run submission, tiled shaping, grapheme-safe wrap/ellipsis, cache reuse/eviction, DPR and baseline preparation, dirty upload spans, rounded clip hit tests, independent flex/grid geometry, retained invalidation, painter order, native focus/IME lifecycle, DOM clipping, SVG serialization, and calendar resize/disposal. Fake Canvas/DOM tests validate control flow and geometry, not actual font raster pixels or physical GPU throughput. Real shader compilation, hardware/device-loss behavior, assistive technology, cross-browser typography and mobile input need target-environment qualification.
+
+The implementation follows the primary [HTML Canvas text preparation and metrics specification](https://html.spec.whatwg.org/multipage/canvas.html#text-preparation-algorithm) and [WebGPU resource/queue specification](https://www.w3.org/TR/webgpu/). Native shaping and accessibility remain platform services; the renderer does not claim to replace them.
